@@ -241,10 +241,6 @@ impl JamApp {
             );
             ui.horizontal(|ui| {
                 let can_control = s.mode == Mode::Hosting || (s.mode == Mode::Guest && s.gc);
-                let prev = egui::Button::new("⏮");
-                if ui.add_enabled(can_control, prev).clicked() {
-                    let _ = self.cmd_tx.send(UiCmd::Pause);
-                }
                 let label = if s.playing { "⏸" } else { "▶" };
                 if ui.add_enabled(can_control, egui::Button::new(label).min_size(egui::vec2(36.0, 26.0))).clicked() {
                     if s.playing {

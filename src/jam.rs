@@ -406,12 +406,12 @@ impl JamCore {
                         let nm = self.player.name();
                         self.sync_shared(|s| s.backend = nm);
                         self.log(format!("switched player → {nm}"));
+                        // adopt the new player's current song + time
+                        self.adopt_player_state();
                         if self.is_host {
                             // tell guests what the new player is doing
                             if let Some(st) = self.player.state() {
                                 if !st.uri.is_empty() {
-                                    self.host_last_uri = Some(st.uri.clone());
-                                    self.host_last_playing = Some(st.playing);
                                     let pos = self.pos.feed(st.position_ms, st.playing);
                                     self.send_guest(json!({
                                         "type": "PLAY", "uri": st.uri, "pos": pos, "ts": now_ms(),
@@ -455,6 +455,34 @@ impl JamCore {
                     self.log("requesting sync…");
                 }
             }
+        }
+    }
+
+    /// Refresh the UI's now-playing/progress from the current player.
+    /// In host mode, also adopts the player's track as the watched baseline.
+    fn adopt_player_state(&mut self) {
+        if let Some(st) = self.player.state() {
+            self.pos.anchor(st.position_ms);
+            if self.is_host {
+                self.host_last_uri = Some(st.uri.clone());
+                self.host_last_playing = Some(st.playing);
+            }
+            let np = if st.uri.is_empty() {
+                None
+            } else {
+                Some(Track {
+                    uri: st.uri.clone(),
+                    title: st.title.clone(),
+                    artist: st.artist.clone(),
+                    art_url: st.art_url.clone(),
+                })
+            };
+            self.sync_shared(|s| {
+                s.now_playing = np;
+                s.playing = st.playing;
+                s.progress_ms = st.position_ms;
+                s.duration_ms = st.duration_ms;
+            });
         }
     }
 
@@ -518,6 +546,11 @@ impl JamCore {
         } else {
             self.target_code = None;
         }
+        // adopt whatever the player is doing right now (song + time)
+        self.host_last_uri = None;
+        self.host_last_playing = None;
+        self.pos.reset();
+        self.adopt_player_state();
     }
 
     fn leave_quiet(&mut self) {
