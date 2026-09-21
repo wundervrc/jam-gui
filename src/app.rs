@@ -12,6 +12,7 @@ pub struct JamApp {
     code_input: String,
     name_input: String,
     gc: bool,
+    add_input: String,
 }
 
 impl JamApp {
@@ -29,6 +30,7 @@ impl JamApp {
             code_input: String::new(),
             name_input: name,
             gc: true,
+            add_input: String::new(),
         }
     }
 
@@ -258,8 +260,7 @@ impl JamApp {
                         let _ = self.cmd_tx.send(UiCmd::SyncNow);
                     }
                 }
-            });
-        });
+            });        });
 
         ui.add_space(6.0);
         // members
@@ -298,6 +299,32 @@ impl JamApp {
             );
         }
 
+        // guest: send a song to the host's queue
+        if s.mode == Mode::Guest {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let parsed = parse_track_uri(&self.add_input);
+                let can = parsed.is_some() && s.connected;
+                ui.label(
+                    egui::RichText::new("➕").size(13.0),
+                );
+                let resp = ui.add_enabled(
+                    s.connected,
+                    egui::TextEdit::singleline(&mut self.add_input)
+                        .hint_text("paste a song link to add to the host's queue…")
+                        .desired_width(ui.available_width() - 90.0),
+                );
+                let clicked = ui.add_enabled(can, egui::Button::new("add")).clicked()
+                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can);
+                if clicked {
+                    if let Some(uri) = parsed {
+                        let _ = self.cmd_tx.send(UiCmd::AddToQueue { uri });
+                        self.add_input.clear();
+                    }
+                }
+            });
+        }
+
         ui.add_space(6.0);
         ui.vertical_centered(|ui| {
             let label = if s.mode == Mode::Hosting { "End Jam" } else { "Leave Jam" };
@@ -325,4 +352,21 @@ impl JamApp {
 fn ms_fmt(ms: f64) -> String {
     let s = (ms / 1000.0) as u64;
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// accept spotify:track:… URIs or open.spotify.com track links
+fn parse_track_uri(input: &str) -> Option<String> {
+    let t = input.trim();
+    if t.starts_with("spotify:track:") {
+        return Some(t.split('?').next()?.to_string());
+    }
+    // https://open.spotify.com/track/ID?...
+    let idx = t.find("open.spotify.com/track/")?;
+    let rest = &t[idx + "open.spotify.com/track/".len()..];
+    let id = rest.split(['?', '/', '&']).next()?;
+    if id.len() == 22 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(format!("spotify:track:{id}"))
+    } else {
+        None
+    }
 }

@@ -104,6 +104,8 @@ pub enum UiCmd {
     Pause,
     Next,
     SyncNow,
+    /// guest mode: send ADD_Q to the host (paste-a-link)
+    AddToQueue { uri: String },
 }
 
 fn make_player(backend: &Backend) -> Result<Box<dyn PlayerBackend>, String> {
@@ -453,6 +455,15 @@ impl JamCore {
                     self.last_sync_req = Some(Instant::now());
                     self.send(json!({"type": "SYNC"}));
                     self.log("requesting sync…");
+                }
+            }
+            UiCmd::AddToQueue { uri } => {
+                if !self.is_host {
+                    self.send(json!({
+                        "type": "ADD_Q", "uri": uri,
+                        "addedBy": { "name": self.display_name(), "image": "" }
+                    }));
+                    self.log("sent song to the host's queue ♪");
                 }
             }
         }
@@ -1229,10 +1240,10 @@ impl JamCore {
     }
 
     /// Skip: use the player's own queue when it has one (cliamp / TrackList),
-    /// otherwise advance the bridge queue.
+    /// otherwise advance the bridge queue — and if the bridge queue is empty
+    /// too, just skip in the player itself.
     fn host_next(&mut self) {
-        if self.own_queue == Some(true) {
-            self.log("skipping (player queue)");
+        if self.own_queue == Some(true) || self.queue.is_empty() {
             self.player.next();
             return;
         }
