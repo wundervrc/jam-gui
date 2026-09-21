@@ -124,6 +124,63 @@ struct PendingSeek {
     opened: bool,
 }
 
+/// Interpolates playback position between player reads — spotifast's MPRIS
+/// `Position` property freezes at song start, so clients must predict
+/// `last + elapsed` while playing and re-anchor when the reporter moves.
+#[derive(Default)]
+struct PosTracker {
+    anchor_pos: f64,
+    anchor_at: Option<Instant>,
+    last_reported: f64,
+    frozen: bool,
+}
+
+impl PosTracker {
+    fn feed(&mut self, reported_ms: f64, playing: bool) -> f64 {
+        let Some(at) = self.anchor_at else {
+            self.anchor_pos = reported_ms;
+            self.anchor_at = Some(Instant::now());
+            self.last_reported = reported_ms;
+            return reported_ms;
+        };
+        if !playing {
+            self.anchor_pos = reported_ms;
+            self.anchor_at = Some(Instant::now());
+            self.frozen = false;
+            self.last_reported = reported_ms;
+            return reported_ms;
+        }
+        if self.frozen {
+            // reporter stalled — keep predicting, unless it starts moving again
+            if (reported_ms - self.last_reported).abs() > 150.0 {
+                self.frozen = false;
+                self.anchor_pos = reported_ms;
+                self.anchor_at = Some(Instant::now());
+            }
+        } else {
+            let predicted = self.anchor_pos + at.elapsed().as_millis() as f64;
+            if (reported_ms - predicted).abs() > 700.0 {
+                // real seek or stall correction
+                self.anchor_pos = reported_ms;
+                self.anchor_at = Some(Instant::now());
+            } else if (reported_ms - self.last_reported).abs() < 50.0 {
+                self.frozen = true;
+            } else {
+                // healthy advancing reporter — follow the truth
+                self.anchor_pos = reported_ms;
+                self.anchor_at = Some(Instant::now());
+            }
+        }
+        self.last_reported = reported_ms;
+        self.anchor_pos + self.anchor_at.unwrap().elapsed().as_millis() as f64
+    }
+
+    fn reset(&mut self) {
+        self.anchor_at = None;
+        self.frozen = false;
+    }
+}
+
 pub struct JamCore {
     pub shared: Shared,
     cmd_rx: Receiver<UiCmd>,
@@ -158,6 +215,9 @@ pub struct JamCore {
     reconnects: u32,
     reconnect_at: Option<Instant>,
     pending_seek: Option<PendingSeek>,
+    pos: PosTracker,
+    /// Some(true) = backend has its own queue (add_to_queue worked)
+    own_queue: Option<bool>,
     // host-side watcher
     host_last_uri: Option<String>,
     host_last_playing: Option<bool>,
@@ -228,6 +288,8 @@ impl JamCore {
                     reconnects: 0,
                     reconnect_at: None,
                     pending_seek: None,
+                    pos: PosTracker::default(),
+                    own_queue: None,
                     host_last_uri: None,
                     host_last_playing: None,
                     t_ping: Instant::now(),
@@ -329,7 +391,7 @@ impl JamCore {
             }
             UiCmd::Next => {
                 if self.is_host {
-                    self.host_play_next();
+                    self.host_next();
                 } else if self.gc {
                     self.send(json!({"type": "CMD", "a": "next"}));
                 }
@@ -888,13 +950,25 @@ impl JamCore {
             "ADD_Q" if self.is_host => {
                 if let Some(t) = track_from_json(&n) {
                     let who = n.get("addedBy").and_then(|a| a.get("name")).and_then(|x| x.as_str()).unwrap_or("guest");
+                    // prefer the player's own queue (cliamp supports it); fall
+                    // back to the bridge queue otherwise
+                    let mut real = false;
+                    if self.own_queue != Some(false) {
+                        real = self.player.add_to_queue(&t.uri, &t.title, &t.artist);
+                        if real {
+                            self.own_queue = Some(true);
+                        }
+                    }
                     self.queue.push(t.clone());
-                    self.log(format!("queue += {} (from {who}) — {} up next", t.title, self.queue.len()));
+                    self.log(format!("queue += {} (from {who}) — {} up next{}", t.title, self.queue.len(),
+                        if real { " (player queue)" } else { "" }));
                     self.broadcast(json!({"type": "Q", "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>()}));
                     self.sync_shared(|s| s.queue = self.queue.clone());
-                    if let Some(s) = self.player.state() {
-                        if s.uri.is_empty() {
-                            self.host_play_next();
+                    if !real {
+                        if let Some(s) = self.player.state() {
+                            if s.uri.is_empty() {
+                                self.host_play_next();
+                            }
                         }
                     }
                 }
@@ -939,7 +1013,7 @@ impl JamCore {
                             self.player.open_uri(uri, "", "");
                         }
                     }
-                    "next" => self.host_play_next(),
+                    "next" => self.host_next(),
                     _ => {}
                 }
             }
@@ -977,6 +1051,7 @@ impl JamCore {
             return;
         }
         let same = self.player.state().map(|s| s.uri == uri).unwrap_or(false);
+        self.pos.reset();
         if !same {
             let title = np.map(|t| t.title.as_str()).unwrap_or("");
             let artist = np.map(|t| t.artist.as_str()).unwrap_or("");
@@ -1017,6 +1092,9 @@ impl JamCore {
         if !st.playing || st.uri.is_empty() {
             return;
         }
+        // spotifast freezes its Position property — compare against the
+        // interpolated position, not the raw read
+        let local_pos = self.pos.feed(st.position_ms, true);
         let tick_pos = n.get("pos").and_then(|p| p.as_f64()).unwrap_or(0.0);
         let ts = n.get("ts").and_then(|t| t.as_i64()).unwrap_or(now_ms());
         let now = now_ms();
@@ -1026,7 +1104,7 @@ impl JamCore {
             (now - ts).clamp(0, 500) as f64
         };
         let want = tick_pos + comp;
-        let drift = (st.position_ms - want).abs();
+        let drift = (local_pos - want).abs();
         self.drift_ema = if self.drift_ema == 0.0 {
             drift
         } else {
@@ -1055,6 +1133,17 @@ impl JamCore {
         }
         self.drift_count += 1;
         self.drift_count < 2
+    }
+
+    /// Skip: use the player's own queue when it has one (cliamp / TrackList),
+    /// otherwise advance the bridge queue.
+    fn host_next(&mut self) {
+        if self.own_queue == Some(true) {
+            self.log("skipping (player queue)");
+            self.player.next();
+            return;
+        }
+        self.host_play_next();
     }
 
     fn host_play_next(&mut self) {
@@ -1151,17 +1240,20 @@ impl JamCore {
                 }
             }
             Mode::Hosting => {
-                if self.t_host_watch.elapsed() >= Duration::from_millis(1000) {
+                if self.t_host_watch.elapsed() >= Duration::from_secs(1) {
                     self.t_host_watch = Instant::now();
                     if let Some(st) = self.player.state() {
                         let uri_changed = self.host_last_uri.as_deref() != Some(st.uri.as_str());
                         let first = self.host_last_uri.is_none();
+                        if uri_changed {
+                            self.pos.reset();
+                        }
                         self.host_last_uri = Some(st.uri.clone());
                         if uri_changed && !first {
                             if st.uri.is_empty() {
                                 self.broadcast(json!({"type": "PAUSE"}));
                             } else {
-                                // advance our queue if this was a queue track
+                                // drain display-queue entries that just played
                                 if let Some(idx) = self.queue.iter().position(|t| t.uri == st.uri) {
                                     self.queue.drain(..=idx);
                                     self.broadcast(json!({"type": "Q", "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>()}));
@@ -1174,8 +1266,6 @@ impl JamCore {
                                         artist: st.artist.clone(), art_url: st.art_url.clone(),
                                     });
                                     s.playing = st.playing;
-                                    s.progress_ms = st.position_ms;
-                                    s.duration_ms = st.duration_ms;
                                 });
                             }
                         }
@@ -1187,24 +1277,31 @@ impl JamCore {
                             } else {
                                 self.broadcast(json!({"type": "PAUSE"}));
                             }
-                            self.sync_shared(|s| s.playing = st.playing);
                         }
+                        // displayed progress: interpolated (spotifast freezes Position)
+                        let disp = self.pos.feed(st.position_ms, st.playing);
+                        let np_changed = uri_changed || first;
+                        self.sync_shared(|s| {
+                            s.progress_ms = disp;
+                            s.duration_ms = st.duration_ms;
+                            s.playing = st.playing;
+                            if np_changed && !st.uri.is_empty() {
+                                s.now_playing = Some(Track {
+                                    uri: st.uri.clone(), title: st.title.clone(),
+                                    artist: st.artist.clone(), art_url: st.art_url.clone(),
+                                });
+                            }
+                        });
                     }
                 }
                 if self.t_tick.elapsed() >= Duration::from_secs(5) {
                     self.t_tick = Instant::now();
                     if let Some(st) = self.player.state() {
                         if st.playing && !st.uri.is_empty() {
-                            self.broadcast(json!({"type": "SYNC_TICK", "pos": st.position_ms, "ts": now_ms()}));
+                            let pos = self.pos.feed(st.position_ms, true);
+                            self.broadcast(json!({"type": "SYNC_TICK", "pos": pos, "ts": now_ms()}));
                         }
                     }
-                }
-                if let Some(st) = self.player.state() {
-                    self.sync_shared(|s| {
-                        s.progress_ms = st.position_ms;
-                        s.duration_ms = st.duration_ms;
-                        s.playing = st.playing;
-                    });
                 }
             }
             _ => {}

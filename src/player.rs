@@ -35,6 +35,12 @@ pub trait PlayerBackend: Send {
     fn seek_ms(&mut self, ms: f64);
     fn play(&mut self);
     fn pause(&mut self);
+    /// Skip within the player's own queue.
+    fn next(&mut self) {}
+    /// Insert into the player's own queue (plays after current). false = unsupported.
+    fn add_to_queue(&mut self, _uri: &str, _title: &str, _artist: &str) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -44,6 +50,7 @@ pub struct MprisPlayer {
     bus_suffix: String,
     _conn: zbus::blocking::Connection,
     proxy: zbus::blocking::Proxy<'static>,
+    tracklist: zbus::blocking::Proxy<'static>,
     last_trackid: Option<String>,
 }
 
@@ -53,14 +60,21 @@ impl MprisPlayer {
         let name = format!("org.mpris.MediaPlayer2.{bus_suffix}");
         let proxy = zbus::blocking::Proxy::new(
             &conn,
-            name,
+            name.clone(),
             "/org/mpris/MediaPlayer2",
             "org.mpris.MediaPlayer2.Player",
+        )?;
+        let tracklist = zbus::blocking::Proxy::new(
+            &conn,
+            name,
+            "/org/mpris/MediaPlayer2",
+            "org.mpris.MediaPlayer2.TrackList",
         )?;
         Ok(Self {
             bus_suffix: bus_suffix.to_string(),
             _conn: conn,
             proxy,
+            tracklist,
             last_trackid: None,
         })
     }
@@ -166,6 +180,27 @@ impl PlayerBackend for MprisPlayer {
     fn pause(&mut self) {
         let _ = self.proxy.call_method("Pause", &());
     }
+
+    fn next(&mut self) {
+        let _ = self.proxy.call_method("Next", &());
+    }
+
+    fn add_to_queue(&mut self, uri: &str, _title: &str, _artist: &str) -> bool {
+        // TrackList is an optional MPRIS interface; most players don't implement
+        // it (spotifast and official Spotify don't) — the call just fails then.
+        // Insert after the current track when known, else append at the end.
+        let after = self
+            .last_trackid
+            .clone()
+            .unwrap_or_else(|| "/org/mpris/MediaPlayer2/TrackList/NoTrack".into());
+        match zbus::zvariant::ObjectPath::try_from(after) {
+            Ok(path) => self
+                .tracklist
+                .call_method("AddTrack", &(uri.to_string(), path))
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,5 +276,22 @@ impl PlayerBackend for CliampPlayer {
 
     fn pause(&mut self) {
         self.remote("runtime.pause", "{}");
+    }
+
+    fn next(&mut self) {
+        self.remote("runtime.next", "{}");
+    }
+
+    fn add_to_queue(&mut self, uri: &str, title: &str, artist: &str) -> bool {
+        let id = uri.trim_start_matches("spotify:track:");
+        let params = serde_json::json!({
+            "track": {
+                "path": uri,
+                "title": if title.is_empty() { id } else { title },
+                "artist": artist,
+                "provider_meta": { "kind": "track", "trackID": id }
+            }
+        });
+        self.remote("track.queue", &params.to_string())
     }
 }
