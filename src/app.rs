@@ -81,6 +81,18 @@ impl eframe::App for JamApp {
             ui.add_space(4.0);
         });
 
+        egui::TopBottomPanel::bottom("compat").show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new("♪ compatible with Kyzen's Spotify Jam (spicetify-jam)")
+                        .weak()
+                        .size(11.0),
+                );
+                ui.add_space(2.0);
+            });
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| match snapshot.mode {
             Mode::Idle | Mode::Joining => self.idle_screen(ui, &snapshot),
             Mode::Guest => self.session_screen(ui, &snapshot),
@@ -98,7 +110,7 @@ impl JamApp {
         ui.vertical_centered(|ui| {
             ui.heading("Listen together");
             ui.label(
-                egui::RichText::new("join her Spotify Jam — play your side natively")
+                egui::RichText::new("play your side natively — spotifast or cliamp")
                     .weak()
                     .size(13.0),
             );
@@ -107,7 +119,8 @@ impl JamApp {
 
         egui::Grid::new("setup").num_columns(2).spacing([8.0, 8.0]).show(ui, |ui| {
             ui.label("Your name");
-            ui.text_edit_singleline(&mut self.name_input);
+            ui.text_edit_singleline(&mut self.name_input)
+                .on_hover_text("the name other listeners see.\nRecommended: your Spotify display name — that's what the real\nextension would send. Anything works though :3");
             ui.end_row();
 
             ui.label("Player");
@@ -125,6 +138,7 @@ impl JamApp {
             ui.end_row();
         });
 
+        // ---- join ----
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(10.0);
@@ -142,22 +156,37 @@ impl JamApp {
                 });
             }
             ui.text_edit_singleline(&mut self.code_input)
-                .on_hover_text("the 6-character code she gives you");
+                .on_hover_text("the 6-character code from the host");
         });
+        ui.weak(
+            egui::RichText::new("joining someone's Jam? they decide if guests can control playback")
+                .size(11.0),
+        );
 
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.gc, "let her control playback");
-            if ui
-                .add_enabled(!joining, egui::Button::new("Host a Jam").min_size(egui::vec2(120.0, 32.0)))
-                .clicked()
-            {
-                self.send_with_backend(UiCmd::Host {
-                    name: self.name_input.trim().to_string(),
-                    gc: self.gc,
-                    code: None,
-                });
-            }
+        // ---- host ----
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!joining, egui::Button::new("Host a Jam").min_size(egui::vec2(120.0, 32.0)))
+                    .clicked()
+                {
+                    self.send_with_backend(UiCmd::Host {
+                        name: self.name_input.trim().to_string(),
+                        gc: self.gc,
+                        code: None,
+                    });
+                }
+                ui.label(
+                    egui::RichText::new("you get a code to share").weak().size(11.0),
+                );
+            });
+            ui.add_space(2.0);
+            ui.checkbox(&mut self.gc, "let the guest control playback")
+                .on_hover_text("hosting only — lets listeners use play/pause/next/seek\nand add songs to the shared queue. When you join someone\nelse's Jam, the host sets this on their side.");
         });
 
         ui.add_space(16.0);
