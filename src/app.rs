@@ -11,7 +11,6 @@ pub struct JamApp {
     active_backend: Backend,
     code_input: String,
     name_input: String,
-    backend: Backend,
     gc: bool,
 }
 
@@ -26,24 +25,24 @@ impl JamApp {
         Self {
             shared,
             cmd_tx,
-            active_backend: backend.clone(),
+            active_backend: backend,
             code_input: String::new(),
             name_input: name,
-            backend,
             gc: true,
         }
     }
 
-    /// send a command, (re)spawning the core if the backend selection changed
+    /// send a command on the current core (backend changes hot-swap via SetBackend)
     fn send_with_backend(&mut self, cmd: UiCmd) {
-        if self.active_backend != self.backend {
-            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let (shared, cmd_tx) = crate::jam::JamCore::spawn(self.backend.clone(), false, running);
-            self.shared = shared;
-            self.cmd_tx = cmd_tx;
-            self.active_backend = self.backend.clone();
-        }
         let _ = self.cmd_tx.send(cmd);
+    }
+
+    fn send_set_backend(&mut self, b: Backend) {
+        if self.active_backend == b {
+            return;
+        }
+        self.active_backend = b.clone();
+        let _ = self.cmd_tx.send(UiCmd::SetBackend(b));
     }
 }
 
@@ -73,6 +72,25 @@ impl eframe::App for JamApp {
                 if snapshot.ping_ms >= 0 {
                     ui.weak(format!("{}ms", snapshot.ping_ms));
                 }
+                // hot-swappable player picker (works mid-session)
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button(format!("♫ {}", snapshot.backend), |ui| {
+                        let spot = Backend::Spotifast {
+                            bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),
+                        };
+                        if ui.button(spot.label()).clicked() {
+                            self.send_set_backend(spot);
+                            ui.close_menu();
+                        }
+                        if ui.button(Backend::Cliamp.label()).clicked() {
+                            self.send_set_backend(Backend::Cliamp);
+                            ui.close_menu();
+                        }
+                        ui.weak(
+                            egui::RichText::new("switches instantly —\nsessions keep running").size(10.0),
+                        );
+                    });
+                });
             });
             if let Some(err) = &snapshot.error {
                 ui.add_space(2.0);
@@ -121,20 +139,6 @@ impl JamApp {
             ui.label("Your name");
             ui.text_edit_singleline(&mut self.name_input)
                 .on_hover_text("the name other listeners see.\nRecommended: your Spotify display name — that's what the real\nextension would send. Anything works though :3");
-            ui.end_row();
-
-            ui.label("Player");
-            ui.horizontal(|ui| {
-                let spot = Backend::Spotifast {
-                    bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),
-                };
-                egui::ComboBox::from_id_salt("backend")
-                    .selected_text(self.backend.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.backend, spot, Backend::Spotifast { bus_suffix: String::new() }.label());
-                        ui.selectable_value(&mut self.backend, Backend::Cliamp, Backend::Cliamp.label());
-                    });
-            });
             ui.end_row();
         });
 

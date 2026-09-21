@@ -58,18 +58,21 @@ impl MprisPlayer {
     pub fn new(bus_suffix: &str) -> zbus::Result<Self> {
         let conn = zbus::blocking::Connection::session()?;
         let name = format!("org.mpris.MediaPlayer2.{bus_suffix}");
-        let proxy = zbus::blocking::Proxy::new(
-            &conn,
-            name.clone(),
-            "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.Player",
-        )?;
-        let tracklist = zbus::blocking::Proxy::new(
-            &conn,
-            name,
-            "/org/mpris/MediaPlayer2",
-            "org.mpris.MediaPlayer2.TrackList",
-        )?;
+        // NOTE: properties must NOT be cached — MPRIS players don't emit
+        // PropertiesChanged for Position (it's excluded from the spec), so a
+        // cached proxy freezes the position at its first read.
+        let proxy = zbus::blocking::proxy::Builder::<zbus::blocking::Proxy<'static>>::new(&conn)
+            .destination(name.clone())?
+            .path("/org/mpris/MediaPlayer2")?
+            .interface("org.mpris.MediaPlayer2.Player")?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()?;
+        let tracklist = zbus::blocking::proxy::Builder::<zbus::blocking::Proxy<'static>>::new(&conn)
+            .destination(name)?
+            .path("/org/mpris/MediaPlayer2")?
+            .interface("org.mpris.MediaPlayer2.TrackList")?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()?;
         Ok(Self {
             bus_suffix: bus_suffix.to_string(),
             _conn: conn,

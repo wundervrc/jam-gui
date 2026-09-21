@@ -94,15 +94,25 @@ impl Default for SharedState {
 
 pub type Shared = Arc<Mutex<SharedState>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UiCmd {
     Join { code: String, name: String },
     Host { name: String, gc: bool, code: Option<String> },
+    SetBackend(Backend),
     Leave,
     Play,
     Pause,
     Next,
     SyncNow,
+}
+
+fn make_player(backend: &Backend) -> Result<Box<dyn PlayerBackend>, String> {
+    match backend {
+        Backend::Spotifast { bus_suffix } => crate::player::MprisPlayer::new(bus_suffix)
+            .map(|p| Box::new(p) as Box<dyn PlayerBackend>)
+            .map_err(|e| e.to_string()),
+        Backend::Cliamp => Ok(Box::new(crate::player::CliampPlayer::new())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,14 +143,23 @@ struct PosTracker {
     anchor_at: Option<Instant>,
     last_reported: f64,
     frozen: bool,
+    /// during this window, far-off reported positions are treated as stale
+    /// (some players report the previous track's position at song change)
+    grace_until: Option<Instant>,
 }
 
 impl PosTracker {
+    /// Force the anchor to a known position (after our own seek, or song start).
+    fn anchor(&mut self, pos_ms: f64) {
+        self.anchor_pos = pos_ms;
+        self.anchor_at = Some(Instant::now());
+        self.last_reported = pos_ms;
+        self.frozen = false;
+    }
+
     fn feed(&mut self, reported_ms: f64, playing: bool) -> f64 {
         let Some(at) = self.anchor_at else {
-            self.anchor_pos = reported_ms;
-            self.anchor_at = Some(Instant::now());
-            self.last_reported = reported_ms;
+            self.anchor(reported_ms);
             return reported_ms;
         };
         if !playing {
@@ -159,11 +178,16 @@ impl PosTracker {
             }
         } else {
             let predicted = self.anchor_pos + at.elapsed().as_millis() as f64;
-            if (reported_ms - predicted).abs() > 700.0 {
-                // real seek or stall correction
-                self.anchor_pos = reported_ms;
-                self.anchor_at = Some(Instant::now());
-            } else if (reported_ms - self.last_reported).abs() < 50.0 {
+            let off = (reported_ms - predicted).abs();
+            if off > 700.0 {
+                if self.grace_until.map(|g| Instant::now() < g).unwrap_or(false) {
+                    // stale report right after a song change — ignore
+                } else {
+                    // real seek or stall correction
+                    self.anchor_pos = reported_ms;
+                    self.anchor_at = Some(Instant::now());
+                }
+            } else if off < 50.0 {
                 self.frozen = true;
             } else {
                 // healthy advancing reporter — follow the truth
@@ -178,6 +202,7 @@ impl PosTracker {
     fn reset(&mut self) {
         self.anchor_at = None;
         self.frozen = false;
+        self.grace_until = None;
     }
 }
 
@@ -245,17 +270,12 @@ impl JamCore {
         std::thread::Builder::new()
             .name("jam-core".into())
             .spawn(move || {
-                let player: Box<dyn PlayerBackend> = match &backend {
-                    Backend::Spotifast { bus_suffix } => {
-                        match crate::player::MprisPlayer::new(bus_suffix) {
-                            Ok(p) => Box::new(p),
-                            Err(e) => {
-                                s.lock().unwrap().error = Some(format!("MPRIS player “{bus_suffix}” not reachable: {e}"));
-                                return;
-                            }
-                        }
+                let player: Box<dyn PlayerBackend> = match make_player(&backend) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        s.lock().unwrap().error = Some(e);
+                        return;
                     }
-                    Backend::Cliamp => Box::new(crate::player::CliampPlayer::new()),
                 };
                 let mut core = JamCore {
                     shared: shared2,
@@ -373,6 +393,38 @@ impl JamCore {
             UiCmd::Host { name, gc, code } => {
                 self.gc = gc;
                 self.start_session(true, code.unwrap_or_default(), name)
+            }
+            UiCmd::SetBackend(b) => {
+                match make_player(&b) {
+                    Ok(p) => {
+                        self.player = p;
+                        self.pos.reset();
+                        self.host_last_uri = None;
+                        self.host_last_playing = None;
+                        self.pending_seek = None;
+                        self.own_queue = None;
+                        let nm = self.player.name();
+                        self.sync_shared(|s| s.backend = nm);
+                        self.log(format!("switched player → {nm}"));
+                        if self.is_host {
+                            // tell guests what the new player is doing
+                            if let Some(st) = self.player.state() {
+                                if !st.uri.is_empty() {
+                                    self.host_last_uri = Some(st.uri.clone());
+                                    self.host_last_playing = Some(st.playing);
+                                    let pos = self.pos.feed(st.position_ms, st.playing);
+                                    self.send_guest(json!({
+                                        "type": "PLAY", "uri": st.uri, "pos": pos, "ts": now_ms(),
+                                        "np": host_np(&st), "paused": !st.playing, "dur": st.duration_ms,
+                                    }));
+                                }
+                            }
+                        }
+                        // guest mode: enforce_lock pulls the new player to the
+                        // host's target within 2s, nothing else needed
+                    }
+                    Err(e) => self.log(format!("player switch failed: {e}")),
+                }
             }
             UiCmd::Leave => self.leave(),
             UiCmd::Play => {
@@ -856,6 +908,7 @@ impl JamCore {
                 if !self.dry_run {
                     self.player.seek_ms(target);
                 }
+                self.pos.anchor(target);
                 self.log(format!("seek → {}ms", target as u64));
             }
             "SYNC_TICK" => self.drift_correct(&n),
@@ -903,15 +956,19 @@ impl JamCore {
                 self.guest_name = name.clone();
                 let st = self.player.state();
                 let np = st.as_ref().map(host_np);
+                let (prog, playing) = match &st {
+                    Some(s) => (self.pos.feed(s.position_ms, s.playing), s.playing),
+                    None => (0.0, false),
+                };
                 let init = json!({
                     "np": np,
                     "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>(),
                     "host": self.display_name(),
                     "gc": self.gc,
-                    "playing": st.as_ref().map(|s| s.playing).unwrap_or(false),
+                    "playing": playing,
                     "members": [json!({"id": "host", "name": self.display_name(), "isHost": true}),
                                  json!({"id": "guest", "name": name, "image": ""})],
-                    "progress": st.as_ref().map(|s| s.position_ms).unwrap_or(0.0),
+                    "progress": prog,
                     "duration": st.as_ref().map(|s| s.duration_ms).unwrap_or(0.0),
                 });
                 self.send_guest(json!({"type": "INIT", "np": init["np"], "queue": init["queue"],
@@ -919,7 +976,7 @@ impl JamCore {
                     "members": init["members"], "progress": init["progress"], "duration": init["duration"]}));
                 if let Some(s) = &st {
                     if !s.uri.is_empty() {
-                        self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": s.position_ms,
+                        self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": prog,
                             "ts": now_ms(), "np": host_np(s), "paused": !s.playing, "dur": s.duration_ms}));
                     }
                 }
@@ -942,7 +999,8 @@ impl JamCore {
             "SYNC" if self.is_host => {
                 if let Some(s) = self.player.state() {
                     if !s.uri.is_empty() {
-                        self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": s.position_ms,
+                        let pos = self.pos.feed(s.position_ms, s.playing);
+                        self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": pos,
                             "ts": now_ms(), "np": host_np(&s), "paused": !s.playing, "dur": s.duration_ms}));
                     }
                 }
@@ -1067,8 +1125,10 @@ impl JamCore {
             let want = pos_ms + comp;
             if paused {
                 self.player.pause();
+                self.pos.anchor(want);
             } else if (st.position_ms - want).abs() > 400.0 {
                 self.player.seek_ms(want);
+                self.pos.anchor(want);
                 if !st.playing {
                     self.player.play();
                 }
@@ -1161,8 +1221,11 @@ impl JamCore {
     }
 
     fn host_broadcast_play(&mut self, st: &PlayerState) {
+        // resume/current-state updates use the interpolated position —
+        // raw reads can be stale on some players
+        let pos = self.pos.feed(st.position_ms, st.playing);
         self.send_guest(json!({
-            "type": "PLAY", "uri": st.uri, "pos": st.position_ms, "ts": now_ms(),
+            "type": "PLAY", "uri": st.uri, "pos": pos, "ts": now_ms(),
             "np": host_np(st), "paused": !st.playing, "dur": st.duration_ms,
         }));
     }
@@ -1193,10 +1256,12 @@ impl JamCore {
                                 self.player.pause();
                             }
                         }
+                        self.pos.anchor(p.target_ms);
                     } else if Instant::now() > p.deadline {
                         if !self.dry_run {
                             self.player.seek_ms(p.target_ms);
                         }
+                        self.pos.anchor(p.target_ms);
                         self.pending_seek = None;
                     }
                 }
@@ -1259,7 +1324,15 @@ impl JamCore {
                                     self.broadcast(json!({"type": "Q", "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>()}));
                                     self.sync_shared(|s| s.queue = self.queue.clone());
                                 }
-                                self.host_broadcast_play(&st);
+                                // song changes start at 0 — never trust the player's
+                                // position here (it can be stale, e.g. cached or the
+                                // previous track's). Grace period ignores stale reads.
+                                self.pos.anchor(0.0);
+                                self.pos.grace_until = Some(Instant::now() + Duration::from_secs(5));
+                                self.broadcast(json!({
+                                    "type": "PLAY", "uri": st.uri, "pos": 0, "ts": now_ms(),
+                                    "np": host_np(&st), "paused": !st.playing, "dur": st.duration_ms,
+                                }));
                                 self.sync_shared(|s| {
                                     s.now_playing = Some(Track {
                                         uri: st.uri.clone(), title: st.title.clone(),
@@ -1280,6 +1353,9 @@ impl JamCore {
                         }
                         // displayed progress: interpolated (spotifast freezes Position)
                         let disp = self.pos.feed(st.position_ms, st.playing);
+                        if std::env::var("JAM_DEBUG").is_ok() {
+                            self.log(format!("pos: reported={}ms interp={:.0}ms frozen={}", st.position_ms as u64, disp, self.pos.frozen));
+                        }
                         let np_changed = uri_changed || first;
                         self.sync_shared(|s| {
                             s.progress_ms = disp;
