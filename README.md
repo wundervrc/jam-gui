@@ -1,6 +1,6 @@
 # Jam
 
-**Listen to Spotify together — from lightweight players, not the heavy official app.**
+**Listen to Spotify together — from lightweight players, not the heavy official Spotify app.**
 
 A native **Rust + egui** client that joins or hosts [Spicetify Jam](https://github.com/Kyzenkms/spicetify-jam)
 sessions (Kyzen's P2P listen-together extension for Spotify desktop) and plays your side through
@@ -90,7 +90,7 @@ node bridges/spotifast/jam-bridge.mjs TEST12 --dry-run
 
 - **[Spicetify Jam](https://github.com/Kyzenkms/spicetify-jam) by Kyzenkms** — the protocol, sync
   heuristics and session design are Kyzen's; this project is a compatible client, not a fork.
-- [Spotifast](https://github.com/crmne/spotifast) by crmne (MIT) · [cliamp](https://github.com/wundervrc)
+- [Spotifast](https://github.com/crmne/spotifast) by crmne (MIT) · [cliamp](https://github.com/bjarneo/cliamp) by bjarneo
 - [libdatachannel](https://github.com/paullouisageneau/libdatachannel) · [peerjs](https://github.com/peers/peerjs)
 
 ## Licence
