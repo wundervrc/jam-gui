@@ -248,6 +248,7 @@ pub struct JamCore {
     // host-side watcher
     host_last_uri: Option<String>,
     host_last_playing: Option<bool>,
+    t_host_pause: Instant,
     // timers
     t_ping: Instant,
     t_sync: Instant,
@@ -314,6 +315,7 @@ impl JamCore {
                     own_queue: None,
                     host_last_uri: None,
                     host_last_playing: None,
+                    t_host_pause: Instant::now(),
                     t_ping: Instant::now(),
                     t_sync: Instant::now(),
                     t_lock: Instant::now(),
@@ -337,6 +339,11 @@ impl JamCore {
                 })
                 .unwrap_or_default(),
             msg.into());
+        // JAM_DEBUG: mirror everything to stderr so GUI users can capture it;
+        // headless mode prints every line regardless.
+        if std::env::var("JAM_DEBUG").is_ok() {
+            eprintln!("{line}");
+        }
         if let Ok(mut s) = self.shared.lock() {
             s.logs.push_back(line);
             while s.logs.len() > 400 {
@@ -896,6 +903,16 @@ impl JamCore {
 
     // ------------------------------------------------------------------
     fn handle_jam(&mut self, n: Value) {
+        if std::env::var("JAM_DEBUG").is_ok() {
+            let t = n.get("type").and_then(|x| x.as_str()).unwrap_or("?");
+            let extra = match t {
+                "PING" => format!(" ts={:?}", n.get("ts").and_then(|x| x.as_i64())),
+                "SYNC_TICK" => format!(" pos={:?} ts={:?}", n.get("pos").and_then(|x| x.as_f64()), n.get("ts").and_then(|x| x.as_i64())),
+                "PLAY" => format!(" uri={:?} pos={:?}", n.get("uri").and_then(|x| x.as_str()), n.get("pos").and_then(|x| x.as_f64())),
+                _ => String::new(),
+            };
+            self.log(format!("← {t}{extra}"));
+        }
         let mtype = n.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match mtype {
             "INIT" => {
@@ -1265,6 +1282,13 @@ impl JamCore {
         self.host_play_next();
     }
 
+    fn guest_connected(&self) -> bool {
+        self.p2p
+            .as_ref()
+            .map(|p| p.dc.is_some())
+            .unwrap_or(false)
+    }
+
     fn host_play_next(&mut self) {
         if self.queue.is_empty() {
             self.log("queue empty");
@@ -1435,6 +1459,21 @@ impl JamCore {
                         if st.playing && !st.uri.is_empty() {
                             let pos = self.pos.feed(st.position_ms, true);
                             self.broadcast(json!({"type": "SYNC_TICK", "pos": pos, "ts": now_ms()}));
+                        }
+                    }
+                }
+                // while paused, keep re-asserting the pause — the extension's
+                // paused-join dance (playUri + pause after 150ms) can fail on
+                // free clients, leaving the guest silently playing (+25s drift)
+                if self.t_host_pause.elapsed() >= Duration::from_secs(2) {
+                    self.t_host_pause = Instant::now();
+                    if self.guest_connected() {
+                        if let Some(st) = self.player.state() {
+                            if !st.playing {
+                                self.broadcast(json!({"type": "PAUSE"}));
+                                self.broadcast(json!({"type": "PS", "p": false, "pos": st.position_ms,
+                                    "dur": st.duration_ms, "ts": now_ms()}));
+                            }
                         }
                     }
                 }

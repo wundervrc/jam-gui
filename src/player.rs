@@ -52,6 +52,7 @@ pub struct MprisPlayer {
     proxy: zbus::blocking::Proxy<'static>,
     tracklist: zbus::blocking::Proxy<'static>,
     last_trackid: Option<String>,
+    dbg_last: Option<(String, i64, String)>,
 }
 
 impl MprisPlayer {
@@ -79,6 +80,7 @@ impl MprisPlayer {
             proxy,
             tracklist,
             last_trackid: None,
+            dbg_last: None,
         })
     }
 
@@ -114,9 +116,6 @@ impl PlayerBackend for MprisPlayer {
                 return None;
             }
         };
-        if std::env::var("JAM_DEBUG").is_ok() {
-            eprintln!("mpris ok: status={status} pos={pos} meta={}", serde_json::to_string(&meta).unwrap_or_default());
-        }
         // zvariant -> JSON is far friendlier than matching dict types by hand.
         // OwnedValue serializes as a variant envelope {"signature","value"},
         // and each dict value is wrapped the same way — unwrap both.
