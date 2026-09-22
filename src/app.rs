@@ -18,8 +18,13 @@ pub struct JamApp {
 impl JamApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let backend = Backend::Spotifast {
-            bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),
+        // Windows has no MPRIS — default to the cliamp backend there
+        let backend = if cfg!(windows) {
+            Backend::Cliamp
+        } else {
+            Backend::Spotifast {
+                bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),
+            }
         };
         let (shared, cmd_tx) = crate::jam::JamCore::spawn(backend.clone(), false, running);
         let name = std::env::var("USER").unwrap_or_else(|_| "wunder".into());

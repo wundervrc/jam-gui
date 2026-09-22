@@ -11,6 +11,13 @@ fn main() -> eframe::Result {
     // rustls 0.23 needs an explicit crypto provider before the first TLS handshake
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // On Windows, Mesa's software-GL probes the ZINK (GL-over-Vulkan) driver and
+    // prints an error when no Vulkan loader exists — pin it to llvmpipe (CPU).
+    #[cfg(windows)]
+    if std::env::var("MESA_LOADER_DRIVER_OVERRIDE").is_err() {
+        std::env::set_var("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe");
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let has = |f: &str| args.iter().any(|a| a == f);
     let val = |f: &str| {
