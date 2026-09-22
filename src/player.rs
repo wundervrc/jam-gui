@@ -329,6 +329,7 @@ impl PlayerBackend for CliampPlayer {
 /// spotifast on Windows/macOS: control via its own CLI verbs (now-playing --raw,
 /// play-uri, seek-to, play, pause, next). The binary talks to the running instance.
 pub struct SpotifastWinPlayer {
+    /// candidate binary names, tried in order; the first that spawns wins
     bin: String,
 }
 
@@ -340,12 +341,16 @@ impl SpotifastWinPlayer {
     }
 
     fn run(&self, args: &[&str]) -> Option<String> {
-        std::process::Command::new(&self.bin)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        // try the configured binary first, then common alternate names
+        // (the shipped zip names it spotifast-cli.exe; AUR installs use spotifast)
+        for bin in [&self.bin, "spotifast", "fastpotify", "spotifast-cli"] {
+            if let Ok(out) = std::process::Command::new(bin).args(args).output() {
+                if out.status.success() {
+                    return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                }
+            }
+        }
+        None
     }
 }
 
