@@ -1,36 +1,41 @@
-# jam-gui
+# Jam
 
-**Listen together, natively.** A small, fast Rust + egui app that joins or hosts
-[Spicetify Jam](https://github.com/Kyzenkms/spicetify-jam) sessions (the P2P
-listen-together extension for Spotify desktop) and plays your side through
-**spotifast** or **cliamp** — no Spotify desktop, no Electron, no Node.
+**Listen to Spotify together — from lightweight players, not the heavy official app.**
 
-Single binary, ~15 MB, one thread-pool, uses the official PeerJS cloud for
-signaling and WebRTC data channels for transport (re-implemented natively in
-Rust on top of libdatachannel — no JavaScript anywhere).
+A native **Rust + egui** client that joins or hosts [Spicetify Jam](https://github.com/Kyzenkms/spicetify-jam)
+sessions (Kyzen's P2P listen-together extension for Spotify desktop) and plays your side through
+[Spotifast](https://github.com/crmne/spotifast) or [cliamp](https://github.com/crmne/cliamp) — no
+Spotify desktop, no Electron, no Node required for the GUI.
+
+> **Compatible with Kyzen's Spicetify Jam** — your partner keeps using normal Spotify with the
+> spicetify-jam extension; you run Jam. Either side can host.
 
 ```
-┌─────────────────────────────┐         ┌────────────────────────────────┐
-│        her machine          │         │         your machine           │
-│  Spotify + spicetify-jam    │◀─ P2P ─▶│  jam-gui ──▶ spotifast (MPRIS) │
-│  (Windows, unchanged)       │ WebRTC  │          └─▶ cliamp    (IPC)   │
-└─────────────────────────────┘         └────────────────────────────────┘
+┌─────────────────────────────┐         ┌──────────────────────────────────────┐
+│        their machine        │         │             your machine             │
+│  Spotify + spicetify-jam    │◀─ P2P ─▶│  Jam (this repo) ──▶ spotifast (MPRIS) │
+│  (Windows, unchanged)       │ WebRTC  │                 └──▶ cliamp    (IPC)   │
+└─────────────────────────────┘         └──────────────────────────────────────┘
 ```
+
+No audio is transmitted — only play/pause/seek/song messages. Each side streams from their own
+Spotify account (playback through spotifast/cliamp needs Spotify Premium).
 
 ## Build
 
 ```sh
 cargo build --release
-# needs: rust, cmake + a C++ compiler (libdatachannel), system web-view deps
-# for egui are already part of most desktops (X11/Wayland).
 ```
+
+Requirements: Rust, cmake + a C++ compiler (libdatachannel is vendored and built statically).
 
 ## Use
 
-Run the binary. Type your display name, pick the player backend, then:
+Run the binary. Enter your display name, pick the player backend, then:
 
-- **Join**: enter the 6-character code from her "Start a new Jam"
-- **Host**: you get a code — she joins from her extension as usual
+- **Join** — enter the 6-character code from the host's Jam
+- **Host** — you get a code to share; toggle "let the guest control playback" if you want
+  listeners to be able to play/pause/skip and add songs
 
 Or headless, no GUI:
 
@@ -42,43 +47,52 @@ jam-gui --headless --host --gc --name wunder   # host a Jam
 jam-gui --headless ABC123 --dry-run            # log without touching playback
 ```
 
-## How it's built
+`Ctrl+C` or the Leave button exits the session cleanly.
 
-| module | job |
-|---|---|
-| `src/binarypack.rs` | the msgpack-derived codec peerjs uses on data channels |
-| `src/peerjs.rs` | signaling client (`wss://0.peerjs.com`), WebRTC glue (libdatachannel), chunking |
-| `src/jam.rs` | the jam protocol state machine — guest sync, host broadcast, drift correction, lock |
-| `src/player.rs` | player backends: spotifast via MPRIS (zbus), cliamp via its v2 IPC |
-| `src/app.rs` | the egui front-end |
+## How it works
 
-Sync logic mirrors the original extension: ping/2 latency compensation,
-EMA-smoothed drift correction (seek only past ~650ms), lock-back when the local
-track changes, 3 reconnect attempts with backoff.
+The GUI re-implements the spicetify-jam wire protocol natively in Rust — no JavaScript anywhere:
 
-### Differences vs the reference Node bridges (`jam-bridge`, `jam-cliamp`)
+- **BinaryPack codec** (`src/binarypack.rs`) — byte-compatible with peerjs's js-binarypack
+  (including its swapped string/bin marker ranges)
+- **PeerJS signaling client** (`src/peerjs.rs`) — WebSocket to the public `0.peerjs.com` cloud,
+  heartbeats, offer/answer/candidate flow, message chunking
+- **WebRTC** — libdatachannel (vendored, statically linked)
+- **Jam protocol** (`src/jam.rs`) — guest sync + host broadcast, ping/2 latency compensation,
+  EMA-smoothed drift correction (seeks only past ~650 ms), lock-back when the local track changes,
+  3 reconnect attempts with backoff
+- **Player backends** (`src/player.rs`) — MPRIS for spotifast/anything (zbus, uncached property
+  reads + position interpolation), cliamp v2 IPC (`track.play`, `seek.absolute`, `runtime.play`)
 
-- No Node runtime — a single static-ish binary
-- Host mode supports **one guest** in v1 (fine for two people; the protocol itself is star-shaped)
-- PeerJS TURN relays are not configured in v1 (STUN only) — same NAT behavior
-  as before on typical home internet; see `docs/PROTOCOL.md` if you want to add TURN
-- The author's telemetry endpoints are not implemented (nor are they in the Node bridges)
+The full message protocol is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
-## Testing without her
+## Node bridges (optional fallbacks)
 
-The Node bridges ship simulators that impersonate each side; use them against
-the headless mode:
+The [`bridges/`](bridges/) folder contains earlier **Node.js versions** of the same idea — one for
+spotifast (MPRIS) and one for cliamp (IPC). They speak the identical protocol and were the
+reference implementations the Rust GUI was ported from. Useful if you want a headless daemon
+without building Rust, or want to hack on the protocol in JS:
 
 ```sh
-node ~/jam-bridge/sim/host-sim.mjs TEST12 &
-jam-gui --headless TEST12 --dry-run
+cd bridges/spotifast && npm install
+node jam-bridge.mjs ABC123            # same flags as the GUI's headless mode
 ```
 
-## Credits & license
+Each bridge folder has its own README, and `bridges/sim/` contains simulators that impersonate
+both sides of a real session for testing without a partner:
 
-- The Jam protocol, sync heuristics and session design come from
-  **spicetify-jam by Kyzenkms** (v1.4.1, repo currently unavailable) — this
-  project is a clean-room reimplementation of that wire protocol; no original
-  code is included. Credit for the design belongs to them.
-- [Spotifast](https://github.com/crmne/spotifast) by crmne (MIT), [cliamp](https://github.com/lennytkuchen/cliamp).
-- MIT licensed.
+```sh
+node bridges/sim/host-sim.mjs TEST12 &
+node bridges/spotifast/jam-bridge.mjs TEST12 --dry-run
+```
+
+## Credits
+
+- **[Spicetify Jam](https://github.com/Kyzenkms/spicetify-jam) by Kyzenkms** — the protocol, sync
+  heuristics and session design are Kyzen's; this project is a compatible client, not a fork.
+- [Spotifast](https://github.com/crmne/spotifast) by crmne (MIT) · [cliamp](https://github.com/wundervrc)
+- [libdatachannel](https://github.com/paullouisageneau/libdatachannel) · [peerjs](https://github.com/peers/peerjs)
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

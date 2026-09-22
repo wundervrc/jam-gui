@@ -1,0 +1,17 @@
+{
+  "name": "jam-cliamp",
+  "version": "0.1.0",
+  "description": "Spicetify Jam (P2P listen-together) bridge for cliamp — join or host jam sessions from cliamp via its v2 IPC",
+  "type": "module",
+  "main": "jam-cliamp.mjs",
+  "scripts": {
+    "start": "node jam-cliamp.mjs",
+    "host": "node jam-cliamp.mjs --host --gc",
+    "test:sim": "node sim/host-sim.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "node-datachannel": "^0.33.0",
+    "peerjs": "^1.5.5"
+  }
+}

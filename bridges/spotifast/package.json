@@ -1,0 +1,18 @@
+{
+  "name": "jam-bridge",
+  "version": "0.1.0",
+  "description": "Spicetify Jam (P2P listen-together) bridge for spotifast — join or host jam sessions, playback via MPRIS",
+  "type": "module",
+  "main": "jam-bridge.mjs",
+  "scripts": {
+    "start": "node jam-bridge.mjs",
+    "host": "node jam-bridge.mjs --host --gc",
+    "test:sim": "node sim/host-sim.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dbus-next": "^0.11.0",
+    "node-datachannel": "^0.33.0",
+    "peerjs": "^1.5.5"
+  }
+}
