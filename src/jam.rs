@@ -67,6 +67,9 @@ pub struct SharedState {
     pub error: Option<String>,
     pub backend: &'static str,
     pub logs: VecDeque<String>,
+    pub drift_enabled: bool,
+    pub drift_deadband_ms: f64,
+    pub drift_jump_ms: f64,
 }
 
 impl Default for SharedState {
@@ -88,6 +91,9 @@ impl Default for SharedState {
             error: None,
             backend: "",
             logs: VecDeque::new(),
+            drift_enabled: true,
+            drift_deadband_ms: 160.0,
+            drift_jump_ms: 650.0,
         }
     }
 }
@@ -106,6 +112,8 @@ pub enum UiCmd {
     SyncNow,
     /// guest mode: send ADD_Q to the host (paste-a-link)
     AddToQueue { uri: String },
+    /// fine-tune drift correction on the fly (guest side)
+    SetDrift { enabled: bool, deadband_ms: f64, jump_ms: f64 },
 }
 
 fn make_player(backend: &Backend) -> Result<Box<dyn PlayerBackend>, String> {
@@ -237,6 +245,12 @@ pub struct JamCore {
     ping_ms: i64,
     drift_ema: f64,
     drift_count: u32,
+    /// guest-side sync tuning (fine-tune on the fly):
+    /// corrections fire when smoothed drift exceeds drift_jump_ms,
+    /// ignoring everything under drift_deadband_ms
+    drift_deadband_ms: f64,
+    drift_jump_ms: f64,
+    drift_enabled: bool,
     last_applied: Option<Instant>,
     last_sync_req: Option<Instant>,
     reconnects: u32,
@@ -306,6 +320,9 @@ impl JamCore {
                     ping_ms: -1,
                     drift_ema: 0.0,
                     drift_count: 0,
+                    drift_deadband_ms: 160.0,
+                    drift_jump_ms: 650.0,
+                    drift_enabled: true,
                     last_applied: None,
                     last_sync_req: None,
                     reconnects: 0,
@@ -434,6 +451,24 @@ impl JamCore {
                     }
                     Err(e) => self.log(format!("player switch failed: {e}")),
                 }
+            }
+            UiCmd::SetDrift { enabled, deadband_ms, jump_ms } => {
+                self.drift_enabled = enabled;
+                self.drift_deadband_ms = deadband_ms.max(0.0);
+                self.drift_jump_ms = jump_ms.max(self.drift_deadband_ms);
+                self.drift_ema = 0.0;
+                self.drift_count = 0;
+                self.sync_shared(|s| {
+                    s.drift_enabled = self.drift_enabled;
+                    s.drift_deadband_ms = self.drift_deadband_ms;
+                    s.drift_jump_ms = self.drift_jump_ms;
+                });
+                self.log(format!(
+                    "drift correction: {} (deadband {}ms, jump {}ms)",
+                    if enabled { "on" } else { "manual only" },
+                    deadband_ms as u64,
+                    jump_ms as u64
+                ));
             }
             UiCmd::Leave => self.leave(),
             UiCmd::Play => {
@@ -1202,7 +1237,7 @@ impl JamCore {
             if paused {
                 self.player.pause();
                 self.pos.anchor(want);
-            } else if (st.position_ms - want).abs() > 400.0 {
+            } else if (st.position_ms - want).abs() > self.drift_jump_ms.max(400.0) {
                 self.player.seek_ms(want);
                 self.pos.anchor(want);
                 if !st.playing {
@@ -1246,7 +1281,10 @@ impl JamCore {
         } else {
             0.7 * self.drift_ema + 0.3 * drift
         };
-        if self.drift_ema < 160.0 {
+        if !self.drift_enabled {
+            return;
+        }
+        if self.drift_ema < self.drift_deadband_ms {
             self.drift_count = 0;
             return;
         }
@@ -1263,8 +1301,10 @@ impl JamCore {
     }
 
     fn drift_ma_check(&mut self) -> bool {
-        // seek when >650ms, or >160ms twice in a row (matches the extension)
-        if self.drift_ema >= 650.0 {
+        // seek when smoothed drift exceeds the jump threshold, or when it
+        // exceeds the deadband twice in a row (matches the extension's
+        // 650ms/160ms defaults — now tunable)
+        if self.drift_ema >= self.drift_jump_ms {
             return false;
         }
         self.drift_count += 1;

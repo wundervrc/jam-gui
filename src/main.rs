@@ -88,6 +88,14 @@ fn run_headless(args: &[String]) -> eframe::Result {
         cmd_tx.send(UiCmd::Join { code, name }).expect("core alive");
     }
 
+    // optional drift tuning for headless runs
+    match val("--drift").as_deref() {
+        Some("normal") => { let _ = cmd_tx.send(UiCmd::SetDrift { enabled: true, deadband_ms: 300.0, jump_ms: 1200.0 }); }
+        Some("relaxed") => { let _ = cmd_tx.send(UiCmd::SetDrift { enabled: true, deadband_ms: 600.0, jump_ms: 3000.0 }); }
+        Some("off") => { let _ = cmd_tx.send(UiCmd::SetDrift { enabled: false, deadband_ms: 0.0, jump_ms: 0.0 }); }
+        _ => {}
+    }
+
     let mut printed = 0usize;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(200));

@@ -13,6 +13,7 @@ pub struct JamApp {
     name_input: String,
     gc: bool,
     add_input: String,
+    drift_preset: String,
 }
 
 impl JamApp {
@@ -36,6 +37,7 @@ impl JamApp {
             name_input: name,
             gc: true,
             add_input: String::new(),
+            drift_preset: "Tight".into(),
         }
     }
 
@@ -265,7 +267,50 @@ impl JamApp {
                         let _ = self.cmd_tx.send(UiCmd::SyncNow);
                     }
                 }
-            });        });
+            });
+
+            // drift fine-tuning (guest side — this is where corrections happen)
+            if s.mode == Mode::Guest {
+                ui.add_space(2.0);
+                ui.collapsing(
+                    egui::RichText::new("🎚 drift correction").size(12.0),
+                    |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "deadband {}ms · jump {}ms",
+                                s.drift_deadband_ms as u64,
+                                s.drift_jump_ms as u64
+                            ))
+                            .weak()
+                            .size(10.5),
+                        );
+                        let presets: [(&str, bool, f64, f64, &str); 4] = [
+                            ("Tight", true, 160.0, 650.0, "snaps quickly — best on solid connections"),
+                            ("Normal", true, 300.0, 1200.0, "balanced"),
+                            ("Relaxed", true, 600.0, 3000.0, "fewer jumps for spotty internet / slow machines"),
+                            ("Manual only", false, 0.0, 0.0, "never auto-seeks — use the ↻ sync button"),
+                        ];
+                        for (label, enabled, deadband, jump, hint) in presets {
+                            let selected = s.drift_enabled == enabled
+                                && (!enabled
+                                    || (s.drift_deadband_ms == deadband
+                                        && s.drift_jump_ms == jump));
+                            if ui.selectable_label(selected, label).clicked() {
+                                self.drift_preset = label.to_string();
+                                let _ = self.cmd_tx.send(UiCmd::SetDrift {
+                                    enabled,
+                                    deadband_ms: deadband,
+                                    jump_ms: jump,
+                                });
+                            }
+                            if selected {
+                                ui.label(egui::RichText::new(hint).weak().size(10.5));
+                            }
+                        }
+                    },
+                );
+            }        });
 
         ui.add_space(6.0);
         // members
