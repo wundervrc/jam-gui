@@ -31,31 +31,17 @@ fn main() -> eframe::Result {
         return run_headless(&args);
     }
 
-    let native_options = |renderer: eframe::Renderer| eframe::NativeOptions {
+    let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 640.0])
             .with_min_inner_size([360.0, 520.0]),
-        renderer,
         ..Default::default()
     };
-
-    // Prefer wgpu (Vulkan/DX12 — including WARP software rendering on VMs and
-    // driverless machines), fall back to glow (OpenGL) if wgpu fails.
-    match eframe::run_native(
+    eframe::run_native(
         "Jam",
-        native_options(eframe::Renderer::Wgpu),
+        native_options,
         Box::new(|cc| Ok(Box::new(app::JamApp::new(cc)))),
-    ) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!("wgpu renderer failed: {e:?} — falling back to glow");
-            eframe::run_native(
-                "Jam",
-                native_options(eframe::Renderer::Glow),
-                Box::new(|cc| Ok(Box::new(app::JamApp::new(cc)))),
-            )
-        }
-    }
+    )
 }
 
 fn run_headless(args: &[String]) -> eframe::Result {
