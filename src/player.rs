@@ -16,6 +16,7 @@ pub struct PlayerState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
     Spotifast { bus_suffix: String },
+    SpotifastWin,
     Cliamp,
 }
 
@@ -23,6 +24,7 @@ impl Backend {
     pub fn label(&self) -> &'static str {
         match self {
             Backend::Spotifast { .. } => "spotifast (MPRIS)",
+            Backend::SpotifastWin => "spotifast (CLI)",
             Backend::Cliamp => "cliamp (IPC)",
         }
     }
@@ -321,5 +323,76 @@ impl PlayerBackend for CliampPlayer {
             }
         });
         self.remote("track.queue", &params.to_string())
+    }
+}
+
+/// spotifast on Windows/macOS: control via its own CLI verbs (now-playing --raw,
+/// play-uri, seek-to, play, pause, next). The binary talks to the running instance.
+pub struct SpotifastWinPlayer {
+    bin: String,
+}
+
+impl SpotifastWinPlayer {
+    pub fn new() -> Self {
+        Self {
+            bin: std::env::var("SPOTIFAST_BIN").unwrap_or_else(|_| "spotifast".into()),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Option<String> {
+        std::process::Command::new(&self.bin)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    }
+}
+
+impl PlayerBackend for SpotifastWinPlayer {
+    fn name(&self) -> &'static str {
+        "spotifast-cli"
+    }
+
+    fn state(&mut self) -> Option<PlayerState> {
+        let out = self.run(&["now-playing", "--raw"])?;
+        let line = out.lines().next()?;
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 10 {
+            return None;
+        }
+        // fields: state, title, artists, album, position_ms, duration_ms,
+        //         volume, shuffle, repeat, art_url, saved, device
+        let position_ms: f64 = f[4].parse().unwrap_or(0.0);
+        let duration_ms: f64 = f[5].parse().unwrap_or(0.0);
+        Some(PlayerState {
+            playing: f[0] == "Playing",
+            position_ms,
+            duration_ms,
+            uri: String::new(), // the CLI does not expose the uri; matching is title-based
+            title: f[1].to_string(),
+            artist: f[2].to_string(),
+            art_url: f[9].to_string(),
+        })
+    }
+
+    fn open_uri(&mut self, uri: &str, _title: &str, _artist: &str) {
+        self.run(&["play-uri", uri]);
+    }
+
+    fn seek_ms(&mut self, ms: f64) {
+        self.run(&["seek-to", &format!("{}", (ms.max(0.0) / 1000.0) as u64)]);
+    }
+
+    fn play(&mut self) {
+        self.run(&["play"]);
+    }
+
+    fn pause(&mut self) {
+        self.run(&["pause"]);
+    }
+
+    fn next(&mut self) {
+        self.run(&["next"]);
     }
 }

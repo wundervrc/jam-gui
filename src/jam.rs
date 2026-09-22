@@ -123,6 +123,7 @@ fn make_player(backend: &Backend) -> Result<Box<dyn PlayerBackend>, String> {
         Backend::Spotifast { bus_suffix } => crate::player::MprisPlayer::new(bus_suffix)
             .map(|p| Box::new(p) as Box<dyn PlayerBackend>)
             .map_err(|e| e.to_string()),
+        Backend::SpotifastWin => Ok(Box::new(crate::player::SpotifastWinPlayer::new())),
         Backend::Cliamp => Ok(Box::new(crate::player::CliampPlayer::new())),
     }
 }
@@ -133,6 +134,8 @@ fn make_player(backend: &Backend) -> Result<Box<dyn PlayerBackend>, String> {
 #[derive(Clone)]
 struct Target {
     uri: String,
+    title: String,
+    artist: String,
     pos_ms: f64,
     at: Instant,
     playing: bool,
@@ -1025,6 +1028,8 @@ impl JamCore {
                 if let (Some(p), Some(pos)) = (p, pos) {
                     self.target = Some(Target {
                         uri: self.target.as_ref().map(|t| t.uri.clone()).unwrap_or_default(),
+                        title: self.target.as_ref().map(|t| t.title.clone()).unwrap_or_default(),
+                        artist: self.target.as_ref().map(|t| t.artist.clone()).unwrap_or_default(),
                         pos_ms: pos,
                         at: Instant::now(),
                         playing: p,
@@ -1212,7 +1217,15 @@ impl JamCore {
                     }
                     "playuri" => {
                         if let Some(uri) = n.get("uri").and_then(|u| u.as_str()) {
-                            self.player.open_uri(uri, "", "");
+                            let mut t = Track {
+                                uri: uri.to_string(),
+                                title: String::new(),
+                                artist: String::new(),
+                                art_url: String::new(),
+                            };
+                            self.resolve_track_meta(&mut t);
+                            self.log(format!("playing guest request: {}", t.title));
+                            self.player.open_uri(uri, &t.title, &t.artist);
                         }
                     }
                     "next" => self.host_next(),
@@ -1236,6 +1249,8 @@ impl JamCore {
         let comp = self.comp_ms();
         self.target = Some(Target {
             uri: uri.to_string(),
+            title: np.map(|t| t.title.clone()).unwrap_or_default(),
+            artist: np.map(|t| t.artist.clone()).unwrap_or_default(),
             pos_ms,
             at: Instant::now(),
             playing: !paused,
@@ -1347,8 +1362,7 @@ impl JamCore {
     /// Skip: use the player's own queue when it has one (cliamp / TrackList),
     /// otherwise advance the bridge queue — and if the bridge queue is empty
     /// too, just skip in the player itself.
-    fn host_next(&mut self) {
-        if self.own_queue == Some(true) || self.queue.is_empty() {
+    fn host_next(&mut self) {        if self.own_queue == Some(true) || self.queue.is_empty() {
             self.player.next();
             return;
         }
@@ -1625,7 +1639,13 @@ impl JamCore {
             return;
         }
         if let Some(st) = self.player.state() {
-            if st.uri != t.uri {
+            // spotifast-cli does not expose the uri — fall back to title matching
+            let on_target = if st.uri.is_empty() && !st.title.is_empty() && !t.title.is_empty() {
+                st.title == t.title
+            } else {
+                st.uri == t.uri
+            };
+            if !on_target {
                 // guest picked their own song with guest controls on — ask the
                 // host to play it instead of snapping back (matches the
                 // extension's songchange CMD playuri behavior)
@@ -1650,7 +1670,12 @@ impl JamCore {
                 } else {
                     t.pos_ms
                 };
-                self.apply_playback(&t.uri, pos, !t.playing, None);
+                let np = if t.title.is_empty() {
+                    None
+                } else {
+                    Some(Track { uri: t.uri.clone(), title: t.title.clone(), artist: t.artist.clone(), art_url: String::new() })
+                };
+                self.apply_playback(&t.uri, pos, !t.playing, np.as_ref());
             }
         }
     }

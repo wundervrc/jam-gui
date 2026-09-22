@@ -84,12 +84,22 @@ impl eframe::App for JamApp {
                 // hot-swappable player picker (works mid-session)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.menu_button(format!("♫ {}", snapshot.backend), |ui| {
-                        let spot = Backend::Spotifast {
-                            bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),
-                        };
-                        if ui.button(spot.label()).clicked() {
-                            self.send_set_backend(spot);
-                            ui.close_menu();
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let spot = Backend::Spotifast {
+                                bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),
+                            };
+                            if ui.button(spot.label()).clicked() {
+                                self.send_set_backend(spot);
+                                ui.close_menu();
+                            }
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            if ui.button(Backend::SpotifastWin.label()).clicked() {
+                                self.send_set_backend(Backend::SpotifastWin);
+                                ui.close_menu();
+                            }
                         }
                         if ui.button(Backend::Cliamp.label()).clicked() {
                             self.send_set_backend(Backend::Cliamp);
