@@ -761,6 +761,21 @@ impl JamCore {
     }
 
     fn send(&mut self, msg: Value) {
+        if std::env::var("JAM_DEBUG").is_ok() {
+            let t = msg.get("type").and_then(|x| x.as_str()).unwrap_or("?");
+            let brief = match t {
+                "PLAY" | "SYNC_TICK" | "PS" | "SEEK" => format!(
+                    "{} uri={} pos={:?} ts={:?}",
+                    t,
+                    msg.get("uri").and_then(|x| x.as_str()).unwrap_or(""),
+                    msg.get("pos").and_then(|x| x.as_f64()),
+                    msg.get("ts").and_then(|x| x.as_i64()),
+                ),
+                "PONG" => format!("PONG ts={:?}", msg.get("ts").and_then(|x| x.as_i64())),
+                _ => t.to_string(),
+            };
+            self.log(format!("→ {brief}"));
+        }
         let frames = self.codec.encode(&msg);
         if let Some(p) = self.p2p.as_mut() {
             p.send_frames(&frames);
@@ -1349,7 +1364,7 @@ impl JamCore {
                 }
             }
             Mode::Hosting => {
-                if self.t_host_watch.elapsed() >= Duration::from_secs(1) {
+                if self.t_host_watch.elapsed() >= Duration::from_millis(300) {
                     self.t_host_watch = Instant::now();
                     if let Some(st) = self.player.state() {
                         let uri_changed = self.host_last_uri.as_deref() != Some(st.uri.as_str());
