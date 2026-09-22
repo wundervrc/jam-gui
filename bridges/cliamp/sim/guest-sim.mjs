@@ -24,7 +24,7 @@ peer.on('open', () => {
     setTimeout(() => {
       if (conn.open) {
         log('sending ADD_Q (uri only — matches the real extension)');
-        conn.send({ type: 'ADD_Q', uri: 'spotify:track:0V3wPSppKZxFKyYtUw2pCF', addedBy: { name: NAME } });
+        conn.send({ type: 'ADD_Q', uri: 'spotify:track:4cOdK2wGLETKBW3PvgPWqT', addedBy: { name: NAME } });
       }
     }, 12000);
     setTimeout(() => {
