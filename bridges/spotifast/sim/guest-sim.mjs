@@ -23,8 +23,8 @@ peer.on('open', () => {
     setTimeout(() => { if (conn.open) { log('sending CMD play'); conn.send({ type: 'CMD', a: 'play' }); } }, 9000);
     setTimeout(() => {
       if (conn.open) {
-        log('sending ADD_Q');
-        conn.send({ type: 'ADD_Q', uri: 'spotify:track:0V3wPSppKZxFKyYtUw2pCF', title: 'sock money', artist: 'test', addedBy: { name: NAME } });
+        log('sending ADD_Q (uri only — matches the real extension)');
+        conn.send({ type: 'ADD_Q', uri: 'spotify:track:0V3wPSppKZxFKyYtUw2pCF', addedBy: { name: NAME } });
       }
     }, 12000);
   });

@@ -265,6 +265,8 @@ pub struct JamCore {
     host_last_uri: Option<String>,
     host_last_playing: Option<bool>,
     t_host_pause: Instant,
+    http: ureq::Agent,
+    title_cache: std::collections::HashMap<String, (String, String)>,
     // timers
     t_ping: Instant,
     t_sync: Instant,
@@ -335,6 +337,10 @@ impl JamCore {
                     host_last_uri: None,
                     host_last_playing: None,
                     t_host_pause: Instant::now(),
+                    http: ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_secs(4))
+                        .build(),
+                    title_cache: std::collections::HashMap::new(),
                     t_ping: Instant::now(),
                     t_sync: Instant::now(),
                     t_lock: Instant::now(),
@@ -1127,8 +1133,16 @@ impl JamCore {
                 }
             }
             "ADD_Q" if self.is_host => {
-                if let Some(t) = track_from_json(&n) {
+                if let Some(mut t) = track_from_json(&n) {
                     let who = n.get("addedBy").and_then(|a| a.get("name")).and_then(|x| x.as_str()).unwrap_or("guest");
+                    // the extension's ADD_Q carries only the URI — resolve the
+                    // real title (and album art) via oEmbed when missing
+                    if t.title.is_empty() {
+                        self.lookup_track_meta(&t.uri);
+                        if let Some(resolved) = self.queue.iter().find(|q| q.uri == t.uri) {
+                            t = resolved.clone();
+                        }
+                    }
                     // prefer the player's own queue (cliamp supports it); fall
                     // back to the bridge queue otherwise
                     let mut real = false;
@@ -1337,6 +1351,49 @@ impl JamCore {
             .as_ref()
             .map(|p| p.dc.is_some())
             .unwrap_or(false)
+    }
+
+    /// The extension's ADD_Q carries only the URI — resolve the real title
+    /// (and album art) via Spotify's public oEmbed endpoint. Cached per URI.
+    fn lookup_track_meta(&mut self, uri: &str) {
+        if let Some(t) = self.queue.iter_mut().find(|q| q.uri == uri) {
+            if !t.title.is_empty() {
+                return;
+            }
+            if let Some(cached) = self.title_cache.get(uri) {
+                t.title = cached.0.clone();
+                if t.art_url.is_empty() {
+                    t.art_url = cached.1.clone();
+                }
+                return;
+            }
+            let Some(id) = uri.strip_prefix("spotify:track:") else { return };
+            let fetched: Option<Track> = (|| {
+                let resp: serde_json::Value = self
+                    .http
+                    .get(&format!(
+                        "https://open.spotify.com/oembed?url=spotify%3Atrack%3A{id}"
+                    ))
+                    .call()
+                    .ok()?
+                    .into_json()
+                    .ok()?;
+                let title = resp.get("title")?.as_str()?.to_string();
+                let art_url = resp
+                    .get("thumbnail_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some(Track { uri: uri.to_string(), title, artist: String::new(), art_url })
+            })();
+            if let Some(t2) = fetched {
+                self.title_cache.insert(uri.to_string(), (t2.title.clone(), t2.art_url.clone()));
+                if let Some(t) = self.queue.iter_mut().find(|q| q.uri == uri) {
+                    t.title = t2.title;
+                    t.art_url = t2.art_url;
+                }
+            }
+        }
     }
 
     fn host_play_next(&mut self) {
