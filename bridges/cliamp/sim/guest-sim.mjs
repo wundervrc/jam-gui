@@ -27,6 +27,12 @@ peer.on('open', () => {
         conn.send({ type: 'ADD_Q', uri: 'spotify:track:0V3wPSppKZxFKyYtUw2pCF', addedBy: { name: NAME } });
       }
     }, 12000);
+    setTimeout(() => {
+      if (conn.open) {
+        log('sending CMD playuri (guest control: host should play this)');
+        conn.send({ type: 'CMD', a: 'playuri', uri: 'spotify:track:5ChkMS8OtdzJeqyybCc9R5' });
+      }
+    }, 16000);
   });
   conn.on('data', (n) => {
     if (n.type === 'PING') conn.send({ type: 'PONG', ts: n.ts });

@@ -260,6 +260,9 @@ pub struct JamCore {
     joining_since: Option<Instant>,
     pending_seek: Option<PendingSeek>,
     pos: PosTracker,
+    /// guest side: last local uri we asked the host to play (guest control)
+    playuri_sent: Option<String>,
+    playuri_sent_at: Option<Instant>,
     /// Some(true) = backend has its own queue (add_to_queue worked)
     own_queue: Option<bool>,
     // host-side watcher
@@ -335,6 +338,8 @@ impl JamCore {
                     joining_since: None,
                     pending_seek: None,
                     pos: PosTracker::default(),
+                    playuri_sent: None,
+                    playuri_sent_at: None,
                     own_queue: None,
                     host_last_uri: None,
                     host_last_playing: None,
@@ -1623,11 +1628,29 @@ impl JamCore {
 
     fn enforce_lock(&mut self) {
         let Some(t) = self.target.clone() else { return };
-        if t.uri.is_empty() || self.dry_run {
+        if t.uri.is_empty() || self.dry_run && false {
             return;
         }
         if let Some(st) = self.player.state() {
             if st.uri != t.uri {
+                // guest picked their own song with guest controls on — ask the
+                // host to play it instead of snapping back (matches the
+                // extension's songchange CMD playuri behavior)
+                if self.gc && self.playuri_sent.as_deref() != Some(st.uri.as_str()) {
+                    self.send(json!({"type": "CMD", "a": "playuri", "uri": st.uri}));
+                    self.playuri_sent = Some(st.uri.clone());
+                    self.playuri_sent_at = Some(Instant::now());
+                    self.log(format!("guest control: asked the host to play {}", st.title));
+                    return; // wait for the host's broadcast before touching playback
+                }
+                // give the host a moment to follow a playuri we already sent
+                if self.gc {
+                    if let Some(at) = self.playuri_sent_at {
+                        if at.elapsed() < Duration::from_secs(3) {
+                            return;
+                        }
+                    }
+                }
                 self.log(format!("🔒 locked to Jam (was {})", if st.title.is_empty() { &st.uri } else { &st.title }));
                 let pos = if t.playing {
                     t.pos_ms + t.at.elapsed().as_millis() as f64
