@@ -257,6 +257,7 @@ pub struct JamCore {
     last_sync_req: Option<Instant>,
     reconnects: u32,
     reconnect_at: Option<Instant>,
+    joining_since: Option<Instant>,
     pending_seek: Option<PendingSeek>,
     pos: PosTracker,
     /// Some(true) = backend has its own queue (add_to_queue worked)
@@ -331,6 +332,7 @@ impl JamCore {
                     last_sync_req: None,
                     reconnects: 0,
                     reconnect_at: None,
+                    joining_since: None,
                     pending_seek: None,
                     pos: PosTracker::default(),
                     own_queue: None,
@@ -587,6 +589,7 @@ impl JamCore {
             s.mode = Mode::Joining;
             s.error = None;
             s.jam_id = if host { my_id.clone() } else { code.clone() };
+            s.jam_id = if host { my_id.clone() } else { code.clone() };
             s.display_name = name.clone();
             s.gc = self.gc;
             s.backend = self.player.name();
@@ -612,8 +615,10 @@ impl JamCore {
         // guest: remember whose jam we're joining for reconnects
         if !host {
             self.target_code = Some(code);
+            self.joining_since = Some(Instant::now());
         } else {
             self.target_code = None;
+            self.joining_since = None;
         }
         // adopt whatever the player is doing right now (song + time)
         self.host_last_uri = None;
@@ -786,11 +791,15 @@ impl JamCore {
             }
             CoreEvent::PeerError(e) => {
                 self.log(format!("peer error: {e}"));
-                if e.contains("peer-unavailable") || e.contains("Peer unavailable") {
+                let mode = self.shared.lock().map(|s| s.mode).unwrap_or(Mode::Idle);
+                if mode == Mode::Joining {
                     self.sync_shared(|s| {
-                        s.error = Some("Jam not found — check the code".into());
+                        s.error = Some(e.clone());
                         s.mode = Mode::Idle;
+                        s.connected = false;
                     });
+                    // a failed join leaves the old signaling socket dangling
+                    self.leave_quiet();
                 }
             }
             CoreEvent::DcMessage(_) => unreachable!("decoding happens in core"),
@@ -868,12 +877,10 @@ impl JamCore {
             }
             "EXPIRE" => self.log("offer expired"),
             "ERROR" => {
-                let msg = v
-                    .get("payload")
-                    .and_then(|p| p.get("msg"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown");
-                let _ = self.ev_tx.send(CoreEvent::PeerError(msg.to_string()));
+                let ptype = v.get("payload").and_then(|p| p.get("type")).and_then(|m| m.as_str()).unwrap_or("");
+                let msg = v.get("payload").and_then(|p| p.get("msg")).and_then(|m| m.as_str()).unwrap_or("");
+                let combined = if ptype.is_empty() { msg.to_string() } else { format!("{ptype}: {msg}") };
+                let _ = self.ev_tx.send(CoreEvent::PeerError(combined));
             }
             "OFFER" => {
                 // host mode: a guest wants in
@@ -1434,6 +1441,20 @@ impl JamCore {
     // ------------------------------------------------------------------
     fn tick(&mut self) {
         let mode = self.shared.lock().map(|s| s.mode).unwrap_or(Mode::Idle);
+        // stuck-join watchdog: a silent/hung join recovers the button
+        if mode == Mode::Joining {
+            if let Some(since) = self.joining_since {
+                if since.elapsed() >= Duration::from_secs(15) {
+                    self.joining_since = None;
+                    self.leave_quiet();
+                    self.sync_shared(|s| {
+                        s.mode = Mode::Idle;
+                        s.error = Some("Jam not found or unreachable — check the code and try again".into());
+                    });
+                    self.log("join timed out");
+                }
+            }
+        }
         // guest reconnect backoff
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
