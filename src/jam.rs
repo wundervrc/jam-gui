@@ -114,6 +114,8 @@ pub enum UiCmd {
     AddToQueue { uri: String },
     /// fine-tune drift correction on the fly (guest side)
     SetDrift { enabled: bool, deadband_ms: f64, jump_ms: f64 },
+    /// host side: flip "let the guest control playback" live (broadcasts GCTRL)
+    SetGc(bool),
 }
 
 fn make_player(backend: &Backend) -> Result<Box<dyn PlayerBackend>, String> {
@@ -469,6 +471,14 @@ impl JamCore {
                     deadband_ms as u64,
                     jump_ms as u64
                 ));
+            }
+            UiCmd::SetGc(v) => {
+                if self.is_host {
+                    self.gc = v;
+                    self.broadcast(json!({"type": "GCTRL", "on": v}));
+                    self.sync_shared(|s| s.gc = v);
+                    self.log(format!("guest controls {} — broadcast to guests", if v { "enabled" } else { "disabled" }));
+                }
             }
             UiCmd::Leave => self.leave(),
             UiCmd::Play => {

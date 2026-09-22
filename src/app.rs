@@ -375,6 +375,19 @@ impl JamApp {
             });
         }
 
+        // host-only live toggle: matches the extension's Session Settings
+        if s.mode == Mode::Hosting {
+            ui.add_space(2.0);
+            let mut v = s.gc;
+            if ui
+                .checkbox(&mut v, "let the guest control playback")
+                .on_hover_text("hosting only — lets listeners play/pause/skip and add songs.\nApplies instantly; the guest's UI updates live.")
+                .changed()
+            {
+                let _ = self.cmd_tx.send(UiCmd::SetGc(v));
+            }
+        }
+
         ui.add_space(6.0);
         ui.vertical_centered(|ui| {
             let label = if s.mode == Mode::Hosting { "End Jam" } else { "Leave Jam" };
