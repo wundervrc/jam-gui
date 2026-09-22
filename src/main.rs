@@ -40,11 +40,14 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(app::JamApp::new(cc)))),
     ) {
         Ok(()) => Ok(()),
-        Err(_) => eframe::run_native(
-            "Jam",
-            native_options(eframe::Renderer::Glow),
-            Box::new(|cc| Ok(Box::new(app::JamApp::new(cc)))),
-        ),
+        Err(e) => {
+            eprintln!("wgpu renderer failed: {e:?} — falling back to glow");
+            eframe::run_native(
+                "Jam",
+                native_options(eframe::Renderer::Glow),
+                Box::new(|cc| Ok(Box::new(app::JamApp::new(cc)))),
+            )
+        }
     }
 }
 
