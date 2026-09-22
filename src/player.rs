@@ -51,6 +51,7 @@ pub struct MprisPlayer {
     _conn: zbus::blocking::Connection,
     proxy: zbus::blocking::Proxy<'static>,
     tracklist: zbus::blocking::Proxy<'static>,
+    tracklist_ok: Option<bool>,
     last_trackid: Option<String>,
     dbg_last: Option<(String, i64, String)>,
 }
@@ -79,6 +80,7 @@ impl MprisPlayer {
             _conn: conn,
             proxy,
             tracklist,
+            tracklist_ok: None,
             last_trackid: None,
             dbg_last: None,
         })
@@ -187,17 +189,38 @@ impl PlayerBackend for MprisPlayer {
     }
 
     fn add_to_queue(&mut self, uri: &str, _title: &str, _artist: &str) -> bool {
-        // TrackList is an optional MPRIS interface; most players don't implement
-        // it (spotifast and official Spotify don't) — the call just fails then.
-        // Insert after the current track when known, else append at the end.
+        // MPRIS TrackList is optional; the official Spotify client and older
+        // spotifast builds don't implement it. Probe first (cached), then
+        // AddTrack(uri, after=current, play=false) when available.
+        if self.tracklist_ok != Some(true) {
+            if self.tracklist_ok == Some(false) {
+                return false;
+            }
+            let Ok(xml) = self.proxy.introspect() else {
+                self.tracklist_ok = Some(false);
+                return false;
+            };
+            self.tracklist_ok = Some(xml.contains("org.mpris.MediaPlayer2.TrackList"));
+            if self.tracklist_ok != Some(true) {
+                return false;
+            }
+        }
+        let Ok(tl) = zbus::blocking::proxy::Builder::<zbus::blocking::Proxy<'static>>::new(&self._conn)
+            .destination(format!("org.mpris.MediaPlayer2.{}", self.bus_suffix))
+            .and_then(|b| b.path("/org/mpris/MediaPlayer2"))
+            .and_then(|b| b.interface("org.mpris.MediaPlayer2.TrackList"))
+            .and_then(|b| b.cache_properties(zbus::proxy::CacheProperties::No).build())
+        else {
+            self.tracklist_ok = Some(false);
+            return false;
+        };
         let after = self
             .last_trackid
             .clone()
             .unwrap_or_else(|| "/org/mpris/MediaPlayer2/TrackList/NoTrack".into());
         match zbus::zvariant::ObjectPath::try_from(after) {
-            Ok(path) => self
-                .tracklist
-                .call_method("AddTrack", &(uri.to_string(), path))
+            Ok(path) => tl
+                .call_method("AddTrack", &(uri.to_string(), path, false))
                 .is_ok(),
             Err(_) => false,
         }
