@@ -140,8 +140,7 @@ impl PlayerBackend for MprisPlayer {
                     .filter(|u| u.starts_with("spotify:track:"))
             })
             .unwrap_or_default();
-        let duration_us = num("mpris:length").unwrap_or(0.0);
-        let artist = inner("xesam:artist")
+        let duration_us = num("mpris:length").unwrap_or(0.0);        let artist = inner("xesam:artist")
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
@@ -246,7 +245,11 @@ impl PlayerBackend for CliampPlayer {
         Some(PlayerState {
             playing: v.get("state").and_then(|s| s.as_str()) == Some("playing"),
             position_ms: v.get("position").and_then(|p| p.as_f64()).unwrap_or(0.0) * 1000.0,
-            duration_ms: v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) * 1000.0,
+            duration_ms: {
+                let d = v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0);
+                // sanitize: some setups emit denormal garbage durations
+                if !d.is_finite() || !(0.0..=86400.0).contains(&d) { 0.0 } else { d * 1000.0 }
+            },
             uri: if path.starts_with("spotify:track:") { path.into() } else { String::new() },
             title: track.get("title").and_then(|t| t.as_str()).unwrap_or("").into(),
             artist: track.get("artist").and_then(|a| a.as_str()).unwrap_or("").into(),
