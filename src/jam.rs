@@ -1368,29 +1368,40 @@ impl JamCore {
                 return;
             }
             let Some(id) = uri.strip_prefix("spotify:track:") else { return };
-            let fetched: Option<Track> = (|| {
-                let resp: serde_json::Value = self
-                    .http
-                    .get(&format!(
-                        "https://open.spotify.com/oembed?url=spotify%3Atrack%3A{id}"
-                    ))
-                    .call()
-                    .ok()?
-                    .into_json()
-                    .ok()?;
-                let title = resp.get("title")?.as_str()?.to_string();
-                let art_url = resp
-                    .get("thumbnail_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                Some(Track { uri: uri.to_string(), title, artist: String::new(), art_url })
-            })();
-            if let Some(t2) = fetched {
-                self.title_cache.insert(uri.to_string(), (t2.title.clone(), t2.art_url.clone()));
-                if let Some(t) = self.queue.iter_mut().find(|q| q.uri == uri) {
-                    t.title = t2.title;
-                    t.art_url = t2.art_url;
+            let oembed = format!("https://open.spotify.com/oembed?url=spotify%3Atrack%3A{id}");
+            let mut fetched: Option<serde_json::Value> = None;
+            match self.http.get(&oembed).call() {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(v) => fetched = Some(v),
+                    Err(e) => self.log(format!("oembed: parse failed: {e}")),
+                },
+                Err(e) => self.log(format!("oembed: request failed: {e}")),
+            }
+            // Windows fallback: the OS ships curl.exe — use it if ureq failed
+            if fetched.is_none() {
+                if let Ok(out) = std::process::Command::new("curl.exe")
+                    .args(["-s", "--max-time", "6", &oembed])
+                    .output()
+                {
+                    if out.status.success() {
+                        if let Ok(v) = serde_json::from_slice(&out.stdout) {
+                            self.log("oembed: resolved via curl fallback");
+                            fetched = Some(v);
+                        }
+                    }
+                }
+            }
+            let Some(v) = fetched else {
+                self.log(format!("oembed: could not resolve {uri}"));
+                return;
+            };
+            let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let art = v.get("thumbnail_url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            self.title_cache.insert(uri.to_string(), (title.clone(), art.clone()));
+            if let Some(t) = self.queue.iter_mut().find(|q| q.uri == uri) {
+                t.title = title;
+                if t.art_url.is_empty() {
+                    t.art_url = art;
                 }
             }
         }
