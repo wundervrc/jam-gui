@@ -11,11 +11,11 @@ Spotify desktop, no Electron, no Node required for the GUI.
 > spicetify-jam extension; you run Jam. Either side can host.
 
 ```
-┌─────────────────────────────┐         ┌──────────────────────────────────────┐
-│        their machine        │         │             your machine             │
-│  Spotify + spicetify-jam    │◀─ P2P ─▶│  Jam (this repo) ──▶ spotifast (MPRIS) │
-│  (Windows, unchanged)       │ WebRTC  │                 └──▶ cliamp    (IPC)   │
-└─────────────────────────────┘         └──────────────────────────────────────┘
+┌─────────────────────────────┐           ┌───────────────────────────────────────┐
+│        their machine        │           │             your machine              │
+│  Spotify + spicetify-jam    │◀─ P2P ─▶│ Jam (this repo) ──▶ spotifast (MPRIS)|
+│  (Windows, linux)           │ WebRTC    │               └──▶ cliamp    (IPC)   │
+└─────────────────────────────┘           └───────────────────────────────────────┘
 ```
 
 No audio is transmitted — only play/pause/seek/song messages. Each side streams from their own
