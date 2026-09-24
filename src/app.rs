@@ -19,9 +19,9 @@ pub struct JamApp {
 impl JamApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        // Windows has no MPRIS — default to the cliamp backend there
+        // Windows has no MPRIS — default to the spotifast CLI backend there
         let backend = if cfg!(windows) {
-            Backend::Cliamp
+            Backend::SpotifastWin
         } else {
             Backend::Spotifast {
                 bus_suffix: std::env::var("JAM_MPRIS").unwrap_or_else(|_| "fastpotify".into()),

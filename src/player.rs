@@ -390,7 +390,7 @@ impl PlayerBackend for SpotifastWinPlayer {
         let position_ms: f64 = f[4].parse().unwrap_or(0.0);
         let duration_ms: f64 = f[5].parse().unwrap_or(0.0);
         Some(PlayerState {
-            playing: f[0] == "Playing",
+            playing: f[0].eq_ignore_ascii_case("playing"),
             position_ms,
             duration_ms,
             uri: String::new(), // the CLI does not expose the uri; matching is title-based
