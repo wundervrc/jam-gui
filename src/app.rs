@@ -143,10 +143,10 @@ impl eframe::App for JamApp {
                         }
                     });
                 });
-                egui::ScrollArea::vertical().stick_to_bottom(true).show_rows(ui, 11.0, s.logs.len(), |ui, row_range| {
+                egui::ScrollArea::vertical().stick_to_bottom(true).show_rows(ui, 11.0, snapshot.logs.len(), |ui, row_range| {
                     for i in row_range {
-                        if let Some(line) = s.logs.get(i) {
-                            ui.monospace(egui::RichText::new(line).size(10.0));
+                        if let Some(line) = snapshot.logs.get(i) {
+                            ui.monospace(egui::RichText::new(line.as_str()).size(10.0));
                         }
                     }
                 });
