@@ -49,6 +49,14 @@ jam-gui --headless ABC123 --dry-run            # log without touching playback
 
 `Ctrl+C` or the Leave button exits the session cleanly.
 
+## Rate limits
+
+Jam resolves track URIs through Spotify's API (using your logged-in player's
+own credentials) and, as a fallback, public music databases. If songs refuse
+to play, timestamps reset to 0:00, or tracks take unusually long to sync,
+you are probably rate-limited — wait a few minutes and try again. Heavy
+skip/seek testing can trigger this.
+
 ## How it works
 
 The GUI re-implements the spicetify-jam wire protocol natively in Rust — no JavaScript anywhere:

@@ -270,6 +270,9 @@ pub struct JamCore {
     /// guest side: track playing locally when the session started — that song
     /// is not a "pick", so guest control must not push it to the host
     join_baseline: Option<String>,
+    /// guest side: while set, guest-control playuri pushes are suppressed
+    /// (post-join / post-player-switch settle window)
+    settle_until: Option<Instant>,
     /// guest side: local track (key, pos, dur) at the previous lock tick —
     /// detecting a change + near-end of the old one = natural advance
     last_local: Option<(String, f64, f64)>,
@@ -351,6 +354,7 @@ impl JamCore {
                     playuri_sent: None,
                     join_baseline: None,
                     last_local: None,
+                    settle_until: None,
                     playuri_sent_at: None,
                     own_queue: None,
                     host_last_uri: None,
@@ -461,6 +465,18 @@ impl JamCore {
                         self.log(format!("switched player → {nm}"));
                         // adopt the new player's current song + time
                         self.adopt_player_state();
+                        // guest mid-session: the freshly adopted song is not a
+                        // pick — same rule as joining. Never push it to the
+                        // host; sync to the host's track instead, and give the
+                        // new backend a moment before guest-control pushes.
+                        if !self.is_host && self.target.is_some() {
+                            self.join_baseline = self.player.state().map(|s| {
+                                if s.uri.is_empty() { format!("\u{1}{}", s.title) } else { s.uri.clone() }
+                            });
+                            self.last_local = None;
+                            self.settle_until = Some(Instant::now() + Duration::from_secs(5));
+                            self.log("syncing the new player to the host's song…");
+                        }
                         if self.is_host {
                             // tell guests what the new player is doing
                             if let Some(st) = self.player.state() {
@@ -599,6 +615,7 @@ impl JamCore {
             })
         }).flatten();
         self.last_local = None;
+        self.settle_until = if host { None } else { Some(Instant::now() + Duration::from_secs(5)) };
 
         let my_id = if host {
             let id = code
@@ -1814,10 +1831,13 @@ impl JamCore {
                 // still snap back to the host's track below
                 let cur_key = if st.uri.is_empty() { format!("\u{1}{}", st.title) } else { st.uri.clone() };
                 let pre_join = self.join_baseline.as_deref() == Some(cur_key.as_str());
+                // settle window (post-join / post-player-switch): sync to the
+                // host first, no guest-control pushes yet
+                let settling = self.settle_until.map(|t| Instant::now() < t).unwrap_or(false);
                 // guest picked their own song with guest controls on — ask the
                 // host to play it instead of snapping back (matches the
                 // extension's songchange CMD playuri behavior)
-                if self.gc && !pre_join && self.playuri_sent.as_deref() != Some(st.uri.as_str()) {
+                if self.gc && !pre_join && !settling && self.playuri_sent.as_deref() != Some(st.uri.as_str()) {
                     self.send(json!({"type": "CMD", "a": "playuri", "uri": st.uri}));
                     self.playuri_sent = Some(st.uri.clone());
                     self.playuri_sent_at = Some(Instant::now());
