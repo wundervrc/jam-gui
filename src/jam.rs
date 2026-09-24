@@ -143,6 +143,7 @@ struct Target {
 
 struct PendingSeek {
     uri: String,
+    title: String,
     target_ms: f64,
     paused: bool,
     deadline: Instant,
@@ -1144,7 +1145,7 @@ impl JamCore {
             }
             "SYNC" if self.is_host => {
                 if let Some(s) = self.player.state() {
-                    if !s.uri.is_empty() {
+                    if !s.uri.is_empty() || !s.title.is_empty() {
                         let pos = self.pos.feed(s.position_ms, s.playing);
                         self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": pos,
                             "ts": now_ms(), "np": host_np(&s), "paused": !s.playing, "dur": s.duration_ms}));
@@ -1269,7 +1270,19 @@ impl JamCore {
             self.log(format!("[dry-run] PLAY {} @{}ms {}", uri, (pos_ms + comp) as u64, if paused { "(paused)" } else { "" }));
             return;
         }
-        let same = self.player.state().map(|s| s.uri == uri).unwrap_or(false);
+        // uri-less players (spotifast's Windows CLI has no uri) match by
+        // title — a strict uri compare is always false and would reload
+        // the track on every PLAY/SYNC reply
+        let same = self.player.state().map(|s| {
+            if s.uri.is_empty() || uri.is_empty() {
+                match np {
+                    Some(t) => !t.title.is_empty() && s.title == t.title,
+                    None => true, // nothing to compare — assume in place
+                }
+            } else {
+                s.uri == uri
+            }
+        }).unwrap_or(false);
         self.pos.reset();
         if !same {
             let title = np.map(|t| t.title.as_str()).unwrap_or("");
@@ -1277,6 +1290,7 @@ impl JamCore {
             self.player.open_uri(uri, title, artist);
             self.pending_seek = Some(PendingSeek {
                 uri: uri.to_string(),
+                title: title.to_string(),
                 target_ms: pos_ms + comp + 250.0,
                 paused,
                 deadline: Instant::now() + Duration::from_millis(4500),
@@ -1310,7 +1324,7 @@ impl JamCore {
             }
         }
         let Some(st) = self.player.state() else { return };
-        if !st.playing || st.uri.is_empty() {
+        if !st.playing || (st.uri.is_empty() && st.title.is_empty()) {
             return;
         }
         // spotifast freezes its Position property — compare against the
@@ -1492,7 +1506,12 @@ impl JamCore {
         if let Some(p) = self.pending_seek.as_mut() {
             if !p.opened {
                 if let Some(st) = self.player.state() {
-                    if st.uri == p.uri {
+                    let matches = if p.uri.is_empty() || st.uri.is_empty() {
+                        !p.title.is_empty() && st.title == p.title
+                    } else {
+                        st.uri == p.uri
+                    };
+                    if matches {
                         p.opened = true;
                         if !self.dry_run {
                             self.player.seek_ms(p.target_ms);
