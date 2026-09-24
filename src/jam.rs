@@ -267,6 +267,9 @@ pub struct JamCore {
     /// guest side: last local uri we asked the host to play (guest control)
     playuri_sent: Option<String>,
     playuri_sent_at: Option<Instant>,
+    /// guest side: track playing locally when the session started — that song
+    /// is not a "pick", so guest control must not push it to the host
+    join_baseline: Option<String>,
     /// Some(true) = backend has its own queue (add_to_queue worked)
     own_queue: Option<bool>,
     // host-side watcher
@@ -343,6 +346,7 @@ impl JamCore {
                     pending_seek: None,
                     pos: PosTracker::default(),
                     playuri_sent: None,
+                    join_baseline: None,
                     playuri_sent_at: None,
                     own_queue: None,
                     host_last_uri: None,
@@ -541,6 +545,9 @@ impl JamCore {
     /// Refresh the UI's now-playing/progress from the current player.
     /// In host mode, also adopts the player's track as the watched baseline.
     fn adopt_player_state(&mut self) {
+        // guest mid-session: the display is driven by the host — adopting the
+        // local player's song here would stomp it (e.g. on a backend swap)
+        let guest_active = !self.is_host && self.target.is_some();
         if let Some(st) = self.player.state() {
             self.pos.anchor(st.position_ms);
             if self.is_host {
@@ -559,10 +566,12 @@ impl JamCore {
                 })
             };
             self.sync_shared(|s| {
-                s.now_playing = np;
-                s.playing = st.playing;
-                s.progress_ms = st.position_ms;
-                s.duration_ms = st.duration_ms;
+                if !guest_active {
+                    s.now_playing = np;
+                    s.playing = st.playing;
+                    s.progress_ms = st.position_ms;
+                    s.duration_ms = st.duration_ms;
+                }
             });
         }
     }
@@ -578,6 +587,13 @@ impl JamCore {
         self.host_name.clear();
         self.guest_name.clear();
         self.ping_ms = -1;
+        // guests: remember what was playing locally before the jam — asking
+        // the host to play THAT would hijack the session on join
+        self.join_baseline = (!host).then(|| {
+            self.player.state().map(|s| {
+                if s.uri.is_empty() { format!("\u{1}{}", s.title) } else { s.uri.clone() }
+            })
+        }).flatten();
 
         let my_id = if host {
             let id = code
@@ -1285,6 +1301,13 @@ impl JamCore {
         }).unwrap_or(false);
         self.pos.reset();
         if !same {
+            // uri-less host (e.g. spotifast's Windows CLI): the guest has no
+            // way to open the host's track — follow play/pause/position only,
+            // never open "" (it restarts tracks) and never re-seek a
+            // different local song to the host's position
+            if uri.is_empty() {
+                return;
+            }
             let title = np.map(|t| t.title.as_str()).unwrap_or("");
             let artist = np.map(|t| t.artist.as_str()).unwrap_or("");
             self.player.open_uri(uri, title, artist);
@@ -1710,11 +1733,20 @@ impl JamCore {
             } else {
                 st.uri == t.uri
             };
+            if on_target {
+                // landed on the host's track — the pre-join song no longer
+                // plays, so future local picks are real picks
+                self.join_baseline = None;
+            }
             if !on_target {
+                // the pre-join song is not a pick — never push it to the host;
+                // still snap back to the host's track below
+                let cur_key = if st.uri.is_empty() { format!("\u{1}{}", st.title) } else { st.uri.clone() };
+                let pre_join = self.join_baseline.as_deref() == Some(cur_key.as_str());
                 // guest picked their own song with guest controls on — ask the
                 // host to play it instead of snapping back (matches the
                 // extension's songchange CMD playuri behavior)
-                if self.gc && self.playuri_sent.as_deref() != Some(st.uri.as_str()) {
+                if self.gc && !pre_join && self.playuri_sent.as_deref() != Some(st.uri.as_str()) {
                     self.send(json!({"type": "CMD", "a": "playuri", "uri": st.uri}));
                     self.playuri_sent = Some(st.uri.clone());
                     self.playuri_sent_at = Some(Instant::now());

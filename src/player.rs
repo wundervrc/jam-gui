@@ -165,6 +165,11 @@ impl PlayerBackend for MprisPlayer {
     }
 
     fn open_uri(&mut self, uri: &str, _title: &str, _artist: &str) {
+        // OpenUri("") makes players restart the current track — never call it
+        // with nothing to open (uri-less hosts, e.g. the spotifast CLI backend)
+        if uri.is_empty() {
+            return;
+        }
         let _ = self.proxy.call_method("OpenUri", &(uri.to_string()));
     }
 
@@ -305,6 +310,9 @@ impl PlayerBackend for CliampPlayer {
     }
 
     fn open_uri(&mut self, uri: &str, title: &str, artist: &str) {
+        if uri.is_empty() {
+            return; // nothing to open — uri-less host
+        }
         let id = uri.trim_start_matches("spotify:track:");
         let params = serde_json::json!({
             "track": {
@@ -479,6 +487,9 @@ impl PlayerBackend for SpotifastWinPlayer {
     }
 
     fn open_uri(&mut self, uri: &str, _title: &str, _artist: &str) {
+        if uri.is_empty() {
+            return; // nothing to open — uri-less host
+        }
         self.run(&["play-uri", uri]);
     }
 
