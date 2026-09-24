@@ -546,7 +546,8 @@ impl JamCore {
                 self.host_last_uri = Some(st.uri.clone());
                 self.host_last_playing = Some(st.playing);
             }
-            let np = if st.uri.is_empty() {
+            // uri-less backends (spotifast's CLI) still show the name/artist
+            let np = if st.uri.is_empty() && st.title.is_empty() {
                 None
             } else {
                 Some(Track {
@@ -1551,15 +1552,40 @@ impl JamCore {
                 if self.t_host_watch.elapsed() >= Duration::from_millis(300) {
                     self.t_host_watch = Instant::now();
                     if let Some(st) = self.player.state() {
-                        let uri_changed = self.host_last_uri.as_deref() != Some(st.uri.as_str());
+                        // track-change key: the uri when the player exposes one
+                        // (mpris/cliamp), otherwise title+artist+dur — spotifast's
+                        // CLI has no uri, and keying on "" would never change
+                        let track_key = if st.uri.is_empty() {
+                            format!("{}\u{1}{}\u{1}{}", st.title, st.artist, st.duration_ms)
+                        } else {
+                            st.uri.clone()
+                        };
+                        let uri_changed = self.host_last_uri.as_deref() != Some(track_key.as_str());
                         let first = self.host_last_uri.is_none();
                         if uri_changed {
                             self.pos.reset();
                         }
-                        self.host_last_uri = Some(st.uri.clone());
+                        self.host_last_uri = Some(track_key);
                         if uri_changed && !first {
-                            if st.uri.is_empty() {
+                            if st.uri.is_empty() && st.title.is_empty() {
+                                // player went silent
                                 self.broadcast(json!({"type": "PAUSE"}));
+                            } else if st.uri.is_empty() {
+                                // spotifast-cli: no uri, but the track is known —
+                                // np carries title/artist so guests still follow
+                                self.pos.anchor(0.0);
+                                self.pos.grace_until = Some(Instant::now() + Duration::from_secs(5));
+                                self.broadcast(json!({
+                                    "type": "PLAY", "uri": "", "pos": 0, "ts": now_ms(),
+                                    "np": host_np(&st), "paused": !st.playing, "dur": st.duration_ms,
+                                }));
+                                self.sync_shared(|s| {
+                                    s.now_playing = Some(Track {
+                                        uri: st.uri.clone(), title: st.title.clone(),
+                                        artist: st.artist.clone(), art_url: st.art_url.clone(),
+                                    });
+                                    s.playing = st.playing;
+                                });
                             } else {
                                 // drain display-queue entries that just played
                                 if let Some(idx) = self.queue.iter().position(|t| t.uri == st.uri) {
@@ -1615,7 +1641,7 @@ impl JamCore {
                             s.progress_ms = disp;
                             s.duration_ms = st.duration_ms;
                             s.playing = st.playing;
-                            if np_changed && !st.uri.is_empty() {
+                            if np_changed && !st.title.is_empty() {
                                 s.now_playing = Some(Track {
                                     uri: st.uri.clone(), title: st.title.clone(),
                                     artist: st.artist.clone(), art_url: st.art_url.clone(),
@@ -1627,7 +1653,7 @@ impl JamCore {
                 if self.t_tick.elapsed() >= Duration::from_secs(5) {
                     self.t_tick = Instant::now();
                     if let Some(st) = self.player.state() {
-                        if st.playing && !st.uri.is_empty() {
+                        if st.playing && (!st.uri.is_empty() || !st.title.is_empty()) {
                             let pos = self.pos.feed(st.position_ms, true);
                             self.broadcast(json!({"type": "SYNC_TICK", "pos": pos, "ts": now_ms()}));
                         }
