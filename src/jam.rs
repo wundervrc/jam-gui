@@ -1195,11 +1195,14 @@ impl JamCore {
                     "host": init["host"], "gc": init["gc"], "playing": init["playing"],
                     "members": init["members"], "progress": init["progress"], "duration": init["duration"]}));
                 if let Some(s) = &st {
-                    // Kyzen parity: the join PLAY is sent whenever a track
-                    // exists — uri-less hosts send uri:"" + np (guests follow
-                    // play/pause; they have nothing to open, which is fine)
-                    self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": prog,
-                        "ts": now_ms(), "np": host_np(s), "paused": !s.playing, "dur": s.duration_ms}));
+                    // join PLAY only with a RESOLVED uri: Kyzen guests call
+                    // playUri("") on a uri-less PLAY (never starts audio +
+                    // poisons their targetUri). While the uri resolves, the
+                    // rekey broadcast covers the announcement.
+                    if !s.uri.is_empty() {
+                        self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": prog,
+                            "ts": now_ms(), "np": host_np(s), "paused": !s.playing, "dur": s.duration_ms}));
+                    }
                 }
                 self.send_guest(json!({"type": "MEMBERS", "members": init["members"]}));
                 self.members = vec![
@@ -1218,8 +1221,13 @@ impl JamCore {
                 }
             }
             "SYNC" if self.is_host => {
+                // reply only with a RESOLVED uri: Kyzen guests call
+                // playUri("") on a uri-less PLAY, which can never start
+                // audio and wedges their playback. They re-SYNC within a
+                // second, so waiting for resolution costs nothing. Our own
+                // guests get position sync from SYNC_TICK meanwhile.
                 if let Some(s) = self.player.state() {
-                    if !s.uri.is_empty() || !s.title.is_empty() {
+                    if !s.uri.is_empty() {
                         let pos = self.pos.feed(s.position_ms, s.playing);
                         self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": pos,
                             "ts": now_ms(), "np": host_np(&s), "paused": !s.playing, "dur": s.duration_ms}));
