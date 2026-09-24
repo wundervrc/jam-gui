@@ -58,6 +58,7 @@ fn run_headless(args: &[String]) -> eframe::Result {
         .unwrap_or_else(|| "fastpotify".into());
     let backend = match val("--backend").as_deref() {
         Some("cliamp") => Backend::Cliamp,
+        Some("spotifastwin") | Some("spotifast-cli") => Backend::SpotifastWin,
         Some(other) => Backend::Spotifast { bus_suffix: other.into() },
         None => Backend::Spotifast { bus_suffix },
     };
