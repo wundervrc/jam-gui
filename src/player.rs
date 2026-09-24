@@ -493,8 +493,10 @@ mod win_cred {
         let mut list: *mut *mut Credential = std::ptr::null_mut();
         let ok = unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut list) };
         if ok == 0 || list.is_null() {
+            crate::player::debug_log(&format!("cred enumerate failed: {}", unsafe { std::io::Error::last_os_error() }));
             return None;
         }
+        crate::player::debug_log(&format!("cred enumerate: {count} entries"));
         let mut best: Option<(i64, Vec<u8>)> = None;
         unsafe {
             for i in 0..count as usize {
@@ -522,7 +524,9 @@ mod win_cred {
             CredFree(list as *mut std::ffi::c_void);
         }
         let (_, blob) = best?;
-        String::from_utf8(blob).ok()
+        let s = String::from_utf8(blob).ok();
+        crate::player::debug_log(&format!("grant blob decoded: {}", s.is_some()));
+        s
     }
 }
 
@@ -532,11 +536,24 @@ mod win_cred {
 fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
     let grant_json = win_cred::read_shared_web_grant()?;
-    let v: serde_json::Value = serde_json::from_str(&grant_json).ok()?;
-    let web = v.pointer("/grant/Web")?;
+    let v: serde_json::Value = match serde_json::from_str(&grant_json) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::player::debug_log(&format!("grant parse failed: {e}"));
+            return None;
+        }
+    };
+    let web = match v.pointer("/grant/Web") {
+        Some(w) => w.clone(),
+        None => {
+            crate::player::debug_log("grant has no /grant/Web");
+            return None;
+        }
+    };
     let cid = web.get("client_id").and_then(|x| x.as_str())?.to_string();
     let rtok = web.get("refresh_token").and_then(|x| x.as_str())?.to_string();
     let exp = web.get("expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
+    crate::player::debug_log(&format!("grant ok: exp={exp} now={now}"));
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(8))
         .build();
@@ -545,26 +562,46 @@ fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
     let tok = if exp - 60 > now {
         web.get("access_token").and_then(|x| x.as_str())?.to_string()
     } else {
-        let resp = agent
+        match agent
             .post("https://accounts.spotify.com/api/token")
             .send_form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", rtok.as_str()),
                 ("client_id", cid.as_str()),
-            ])
-            .ok()?
-            .into_json::<serde_json::Value>()
-            .ok()?;
-        crate::player::debug_log("web api token refreshed");
-        resp.get("access_token").and_then(|x| x.as_str())?.to_string()
+            ]) {
+            Ok(r) => match r.into_json::<serde_json::Value>() {
+                Ok(j) => {
+                    crate::player::debug_log("web api token refreshed");
+                    j.get("access_token").and_then(|x| x.as_str())?.to_string()
+                }
+                Err(e) => {
+                    crate::player::debug_log(&format!("refresh json failed: {e}"));
+                    return None;
+                }
+            },
+            Err(e) => {
+                crate::player::debug_log(&format!("refresh failed: {e}"));
+                return None;
+            }
+        }
     };
-    let v: serde_json::Value = agent
+    let v: serde_json::Value = match agent
         .get("https://api.spotify.com/v1/me/player")
         .set("Authorization", &format!("Bearer {tok}"))
         .call()
-        .ok()?
-        .into_json()
-        .ok()?;
+    {
+        Ok(r) => match r.into_json() {
+            Ok(v) => v,
+            Err(e) => {
+                crate::player::debug_log(&format!("me/player json failed: {e}"));
+                return None;
+            }
+        },
+        Err(e) => {
+            crate::player::debug_log(&format!("me/player failed: {e}"));
+            return None;
+        }
+    };
     let uri = v.pointer("/item/uri").and_then(|x| x.as_str())?;
     if !uri.starts_with("spotify:track:") {
         return None;
