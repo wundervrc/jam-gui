@@ -243,13 +243,35 @@ impl CliampPlayer {
         }
     }
 
+    /// same discovery as the spotifast-cli backend: configured binary first,
+    /// then PATH names, the running player's exe, and install locations
+    fn candidate_paths(&self) -> Vec<String> {
+        let mut v = vec![self.bin.clone(), "cliamp".into(), "cliampd".into()];
+        #[cfg(windows)]
+        if let Some(p) = crate::player::find_running_process_exe(&["cliamp.exe", "cliampd.exe"]) {
+            v.push(p.to_string_lossy().into_owned());
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            v.push(format!("{lad}\\Programs\\cliamp\\cliamp.exe"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            v.push(format!("{pf}\\cliamp\\cliamp.exe"));
+        }
+        if let Ok(h) = std::env::var("USERPROFILE") {
+            v.push(format!("{h}\\scoop\\shims\\cliamp.exe"));
+        }
+        v
+    }
+
     fn run(&self, args: &[&str]) -> Option<String> {
-        std::process::Command::new(&self.bin)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        for bin in self.candidate_paths() {
+            if let Ok(out) = std::process::Command::new(&bin).args(args).output() {
+                if out.status.success() {
+                    return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                }
+            }
+        }
+        None
     }
 
     fn remote(&self, op: &str, params: &str) -> bool {
