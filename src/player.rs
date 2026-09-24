@@ -341,16 +341,35 @@ impl SpotifastWinPlayer {
     }
 
     fn run(&self, args: &[&str]) -> Option<String> {
-        // try the configured binary first, then common alternate names
-        // (the shipped zip names it spotifast-cli.exe; AUR installs use spotifast)
-        for bin in [&self.bin, "spotifast", "fastpotify", "spotifast-cli"] {
-            if let Ok(out) = std::process::Command::new(bin).args(args).output() {
+        // try the configured binary first, then common alternate names,
+        // the running player's exe path, and standard install locations
+        for bin in self.candidate_paths() {
+            if let Ok(out) = std::process::Command::new(&bin).args(args).output() {
                 if out.status.success() {
                     return Some(String::from_utf8_lossy(&out.stdout).into_owned());
                 }
             }
         }
         None
+    }
+
+    fn candidate_paths(&self) -> Vec<String> {
+        let mut v = vec![self.bin.clone(), "spotifast".into(), "fastpotify".into(), "spotifast-cli".into()];
+        #[cfg(windows)]
+        if let Some(p) = crate::player::find_running_process_exe(&["spotifast.exe", "fastpotify.exe"]) {
+            v.push(p.to_string_lossy().into_owned());
+        }
+        if let Ok(lad) = std::env::var("LOCALAPPDATA") {
+            v.push(format!("{lad}\\Programs\\spotifast\\spotifast.exe"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            v.push(format!("{pf}\\Spotifast\\spotifast.exe"));
+        }
+        if let Ok(h) = std::env::var("USERPROFILE") {
+            v.push(format!("{h}\\go\\bin\\spotifast.exe"));
+            v.push(format!("{h}\\scoop\\shims\\spotifast.exe"));
+        }
+        v
     }
 }
 
