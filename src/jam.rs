@@ -1294,8 +1294,17 @@ impl JamCore {
 
     fn apply_playback(&mut self, uri: &str, pos_ms: f64, paused: bool, np: Option<&Track>) {
         let comp = self.comp_ms();
+        let msg_uri_empty = uri.is_empty();
+        // uri-less PLAY (pre-resolution window on spotifast hosts): keep the
+        // last real uri in the target so enforce_lock doesn't mistake the
+        // guest's correctly-synced song for a hijack-worthy local pick
+        let target_uri = if uri.is_empty() {
+            self.target.as_ref().map(|t| t.uri.clone()).unwrap_or_default()
+        } else {
+            uri.to_string()
+        };
         self.target = Some(Target {
-            uri: uri.to_string(),
+            uri: target_uri,
             title: np.map(|t| t.title.clone()).unwrap_or_default(),
             artist: np.map(|t| t.artist.clone()).unwrap_or_default(),
             pos_ms,
@@ -1318,7 +1327,7 @@ impl JamCore {
         // title — a strict uri compare is always false and would reload
         // the track on every PLAY/SYNC reply
         let same = self.player.state().map(|s| {
-            if s.uri.is_empty() || uri.is_empty() {
+            if s.uri.is_empty() || msg_uri_empty {
                 match np {
                     Some(t) => !t.title.is_empty() && s.title == t.title,
                     None => true, // nothing to compare — assume in place
