@@ -448,7 +448,7 @@ mod win_cred {
     }
 
     fn wide(s: &str) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
+        s.encode_utf16().chain(std::iter::once(0)).collect()
     }
     fn read_str(p: *const u16) -> String {
         if p.is_null() {
@@ -486,7 +486,8 @@ mod win_cred {
     /// find the shared-web grant credential: spotifast names its web-token
     /// entry "<profile>:shared-web.rocks.fastpotify.Fastpotify" (or
     /// ".rocks.spotifast.Spotifast" in newer builds). The freshest wins.
-    pub fn read_shared_web_grant() -> Option<(String, String, String, i64)> {
+    /// Returns the raw grant JSON text.
+    pub fn read_shared_web_grant() -> Option<String> {
         let filter = wide("*");
         let mut count: u32 = 0;
         let mut list: *mut *mut Credential = std::ptr::null_mut();
