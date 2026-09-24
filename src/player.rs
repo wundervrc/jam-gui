@@ -558,7 +558,7 @@ fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
         crate::player::debug_log("web api token refreshed");
         resp.get("access_token").and_then(|x| x.as_str())?.to_string()
     };
-    let v = agent
+    let v: serde_json::Value = agent
         .get("https://api.spotify.com/v1/me/player")
         .set("Authorization", &format!("Bearer {tok}"))
         .call()
