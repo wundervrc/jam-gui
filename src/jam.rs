@@ -1008,9 +1008,31 @@ impl JamCore {
                 }
                 if let Some(np) = n.get("np") {
                     if let Some(t) = Track::from_np(np) {
+                        // Kyzen parity: INIT's np becomes the sync target —
+                        // the guest knows the host's song before the first
+                        // PLAY arrives, and display state starts correct
+                        self.target = Some(Target {
+                            uri: t.uri.clone(),
+                            title: t.title.clone(),
+                            artist: t.artist.clone(),
+                            pos_ms: n.get("progress").and_then(|p| p.as_f64()).unwrap_or(0.0),
+                            at: Instant::now(),
+                            playing: n.get("playing").and_then(|p| p.as_bool()).unwrap_or(false),
+                        });
                         self.sync_shared(|s| s.now_playing = Some(t));
                     }
                 }
+                self.sync_shared(|s| {
+                    if let Some(v) = n.get("progress").and_then(|p| p.as_f64()) {
+                        s.progress_ms = v;
+                    }
+                    if let Some(v) = n.get("duration").and_then(|d| d.as_f64()) {
+                        s.duration_ms = v;
+                    }
+                    if let Some(v) = n.get("playing").and_then(|p| p.as_bool()) {
+                        s.playing = v;
+                    }
+                });
                 self.sync_shared(|s| {
                     s.host_name = self.host_name.clone();
                     s.gc = self.gc;
@@ -1138,10 +1160,11 @@ impl JamCore {
                     "host": init["host"], "gc": init["gc"], "playing": init["playing"],
                     "members": init["members"], "progress": init["progress"], "duration": init["duration"]}));
                 if let Some(s) = &st {
-                    if !s.uri.is_empty() {
-                        self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": prog,
-                            "ts": now_ms(), "np": host_np(s), "paused": !s.playing, "dur": s.duration_ms}));
-                    }
+                    // Kyzen parity: the join PLAY is sent whenever a track
+                    // exists — uri-less hosts send uri:"" + np (guests follow
+                    // play/pause; they have nothing to open, which is fine)
+                    self.send_guest(json!({"type": "PLAY", "uri": s.uri, "pos": prog,
+                        "ts": now_ms(), "np": host_np(s), "paused": !s.playing, "dur": s.duration_ms}));
                 }
                 self.send_guest(json!({"type": "MEMBERS", "members": init["members"]}));
                 self.members = vec![
@@ -1723,7 +1746,8 @@ impl JamCore {
 
     fn enforce_lock(&mut self) {
         let Some(t) = self.target.clone() else { return };
-        if t.uri.is_empty() || self.dry_run && false {
+        // uri-less targets (spotifast host) still enforce via title matching
+        if t.uri.is_empty() && t.title.is_empty() {
             return;
         }
         if let Some(st) = self.player.state() {
@@ -1739,6 +1763,15 @@ impl JamCore {
                 self.join_baseline = None;
             }
             if !on_target {
+                // natural end-of-track: guests run slightly ahead of the host
+                // and auto-advance into their own junk context moments before
+                // the host broadcasts the real next song — sync, never hijack
+                // (Kyzen's nearEnd guard)
+                let near_end = st.duration_ms > 0.0 && st.duration_ms - st.position_ms < 3000.0;
+                if self.gc && near_end {
+                    self.send(json!({"type": "SYNC"}));
+                    return;
+                }
                 // the pre-join song is not a pick — never push it to the host;
                 // still snap back to the host's track below
                 let cur_key = if st.uri.is_empty() { format!("\u{1}{}", st.title) } else { st.uri.clone() };
