@@ -326,6 +326,50 @@ impl PlayerBackend for CliampPlayer {
     }
 }
 
+/// Append-only debug log next to the exe (only when JAM_DEBUG=1).
+pub fn debug_log(msg: &str) {
+    if std::env::var("JAM_DEBUG").is_err() {
+        return;
+    }
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("jam-gui-debug.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("jam-gui-debug.log"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{} {}", stamp, msg);
+    }
+}
+
+/// Find the exe path of a running player process by name (Windows).
+/// Note: sysinfo reports process names WITHOUT the .exe extension.
+#[cfg(windows)]
+pub fn find_running_process_exe(names: &[&str]) -> Option<std::path::PathBuf> {
+    use sysinfo::{ProcessesToUpdate, System};
+    let bases: Vec<String> = names
+        .iter()
+        .map(|n| n.to_lowercase().trim_end_matches(".exe").to_string())
+        .collect();
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    for (_, proc_) in sys.processes() {
+        let name = proc_.name().to_string_lossy().to_lowercase();
+        let name = name.trim_end_matches(".exe");
+        if bases.iter().any(|b| b == name) {
+            if let Some(exe) = proc_.exe() {
+                debug_log(&format!("process lookup: found {} at {}", name, exe.display()));
+                return Some(exe.to_path_buf());
+            }
+        }
+    }
+    debug_log("process lookup: no running player process found");
+    None
+}
+
 /// spotifast on Windows/macOS: control via its own CLI verbs (now-playing --raw,
 /// play-uri, seek-to, play, pause, next). The binary talks to the running instance.
 pub struct SpotifastWinPlayer {
