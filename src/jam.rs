@@ -685,11 +685,12 @@ impl JamCore {
             }
             CoreEvent::SignalClosed => {
                 let mode = self.shared.lock().map(|s| s.mode).unwrap_or(Mode::Idle);
-                if mode != Mode::Idle {
-                    self.sync_shared(|s| {
-                        s.error = Some("lost the signaling server".into());
-                    });
-                    self.log("signaling closed");
+                if mode != Mode::Idle && !self.closed {
+                    // signaling dropped but the session lives — reconnect the
+                    // socket (existing data channels survive independently)
+                    self.log("signaling server lost — reconnecting…");
+                    self.signaling = None;
+                    self.reconnect_at = Some(Instant::now() + Duration::from_secs(2));
                 }
             }
             CoreEvent::SignalMessage(v) => self.handle_signal(v),
@@ -1456,7 +1457,7 @@ impl JamCore {
         // stuck-join watchdog: a silent/hung join recovers the button
         if mode == Mode::Joining {
             if let Some(since) = self.joining_since {
-                if since.elapsed() >= Duration::from_secs(15) {
+                if since.elapsed() >= Duration::from_secs(6) {
                     self.joining_since = None;
                     self.leave_quiet();
                     self.sync_shared(|s| {
@@ -1467,14 +1468,22 @@ impl JamCore {
                 }
             }
         }
-        // guest reconnect backoff
+        // guest reconnect backoff + signaling recovery (both modes)
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;
-                let code = self.target_code.clone().unwrap_or_default();
-                if let Ok(sig) = Signaling::connect(&random_uuid(), self.ev_tx.clone()) {
+                let connect_id = if self.is_host {
+                    self.jam_id.clone()
+                } else {
+                    random_uuid()
+                };
+                if let Ok(sig) = Signaling::connect(&connect_id, self.ev_tx.clone()) {
                     self.signaling = Some(sig);
-                    self.log(format!("reconnecting to Jam {code}…"));
+                    if self.is_host {
+                        self.log(format!("re-registered Jam {connect_id}"));
+                    } else {
+                        self.log(format!("reconnecting to Jam {}…", self.target_code.clone().unwrap_or_default()));
+                    }
                 }
             }
         }
