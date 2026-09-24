@@ -388,12 +388,23 @@ impl SpotifastWinPlayer {
         // try the configured binary first, then common alternate names,
         // the running player's exe path, and standard install locations
         for bin in self.candidate_paths() {
+            crate::player::debug_log(&format!("spotifast-cli spawn: {} {:?}", bin, args));
             if let Ok(out) = std::process::Command::new(&bin).args(args).output() {
-                if out.status.success() {
+                let ok = out.status.success();
+                crate::player::debug_log(&format!(
+                    "spotifast-cli spawn result: ok={} out_len={} out_head={}",
+                    ok,
+                    out.stdout.len(),
+                    String::from_utf8_lossy(&out.stdout[..out.stdout.len().min(120)])
+                ));
+                if ok {
                     return Some(String::from_utf8_lossy(&out.stdout).into_owned());
                 }
+            } else {
+                crate::player::debug_log("spotifast-cli spawn failed to launch");
             }
         }
+        crate::player::debug_log("spotifast-cli: all candidates exhausted");
         None
     }
 
@@ -427,6 +438,7 @@ impl PlayerBackend for SpotifastWinPlayer {
         let line = out.lines().next()?;
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 10 {
+            crate::player::debug_log(&format!("spotifast-cli state parse: fields={} line={:?}", f.len(), line));
             return None;
         }
         // fields: state, title, artists, album, position_ms, duration_ms,
