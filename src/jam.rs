@@ -273,6 +273,9 @@ pub struct JamCore {
     /// guest side: while set, guest-control playuri pushes are suppressed
     /// (post-join / post-player-switch settle window)
     settle_until: Option<Instant>,
+    /// host side: uri we just forced onto the player (queue jump / guest
+    /// playuri) — the watch must not "override" it with the queue head
+    forced_uri: Option<String>,
     /// guest side: local track (key, pos, dur) at the previous lock tick —
     /// detecting a change + near-end of the old one = natural advance
     last_local: Option<(String, f64, f64)>,
@@ -355,6 +358,7 @@ impl JamCore {
                     join_baseline: None,
                     last_local: None,
                     settle_until: None,
+                    forced_uri: None,
                     playuri_sent_at: None,
                     own_queue: None,
                     host_last_uri: None,
@@ -460,6 +464,7 @@ impl JamCore {
                         self.host_last_playing = None;
                         self.pending_seek = None;
                         self.own_queue = None;
+                        self.forced_uri = None;
                         let nm = self.player.name();
                         self.sync_shared(|s| s.backend = nm);
                         self.log(format!("switched player → {nm}"));
@@ -615,6 +620,7 @@ impl JamCore {
             })
         }).flatten();
         self.last_local = None;
+        self.forced_uri = None;
         self.settle_until = if host { None } else { Some(Instant::now() + Duration::from_secs(5)) };
 
         let my_id = if host {
@@ -676,6 +682,11 @@ impl JamCore {
     }
 
     fn leave_quiet(&mut self) {
+        // cancel any scheduled reconnects — leaving must never come back
+        self.reconnect_at = None;
+        self.reconnects = 0;
+        self.joining_since = None;
+        self.settle_until = None;
         if let Some(dc) = self.p2p.as_mut().and_then(|p| p.dc.as_mut()) {
             let _ = dc.send(&crate::binarypack::pack(&crate::binarypack::Packed::Map(vec![(
                 "__peerData".into(),
@@ -940,8 +951,10 @@ impl JamCore {
                         self.log(format!("OFFER from {src}: {}", sdp.chars().take(160).collect::<String>()));
                     }
                     if self.p2p.is_some() {
-                        self.log(format!("another listener tried to join ({src}) — one guest supported in v1"));
-                        return;
+                        // a fresh offer replaces the existing connection — covers
+                        // guests that left uncleanly (their old DC never fired a
+                        // close, which used to block rejoining forever)
+                        self.log(format!("replacing existing guest connection ({src})"));
                     }
                     self.remote_id = src;
                     let sdp = v.get("payload").and_then(|p| p.get("sdp")).cloned().unwrap_or(Value::Null);
@@ -1289,6 +1302,7 @@ impl JamCore {
                             };
                             self.resolve_track_meta(&mut t);
                             self.log(format!("playing guest request: {}", t.title));
+                            self.forced_uri = Some(uri.to_string());
                             self.player.open_uri(uri, &t.title, &t.artist);
                         }
                     }
@@ -1526,6 +1540,7 @@ impl JamCore {
         }
         let next = self.queue.remove(0);
         self.log(format!("host: playing {} (queue: {})", next.title, self.queue.len()));
+        self.forced_uri = Some(next.uri.clone());
         if !self.dry_run {
             self.player.open_uri(&next.uri, &next.title, &next.artist);
         }
@@ -1684,14 +1699,13 @@ impl JamCore {
                                 // player went silent
                                 self.broadcast(json!({"type": "PAUSE"}));
                             } else if st.uri.is_empty() {
-                                // spotifast-cli: no uri, but the track is known —
-                                // np carries title/artist so guests still follow
-                                self.pos.anchor(0.0);
-                                self.pos.grace_until = Some(Instant::now() + Duration::from_secs(5));
-                                self.broadcast(json!({
-                                    "type": "PLAY", "uri": "", "pos": 0, "ts": now_ms(),
-                                    "np": host_np(&st), "paused": !st.playing, "dur": st.duration_ms,
-                                }));
+                                // resolution pending — HOLD the broadcast:
+                                // uri-less PLAYs wedge Kyzen guests
+                                // (playUri("") fails and their playback
+                                // never starts). The rekey broadcast fires
+                                // once the uri lands; until then position
+                                // flows via SYNC_TICK and the display sync
+                                // below keeps our own UI current.
                                 self.sync_shared(|s| {
                                     s.now_playing = Some(Track {
                                         uri: st.uri.clone(), title: st.title.clone(),
@@ -1700,6 +1714,34 @@ impl JamCore {
                                     s.playing = st.playing;
                                 });
                             } else {
+                                // our own forced track (queue jump / guest playuri)?
+                                if self.forced_uri.as_deref() == Some(st.uri.as_str()) {
+                                    self.forced_uri = None;
+                                } else {
+                                    // queue override: spotifast has no enqueue
+                                    // API — when the player advances to its own
+                                    // next pick while the jam queue still has
+                                    // entries, play the queue head instead.
+                                    // Only at the very start of a track; never
+                                    // for a track that IS a queue entry
+                                    // (cliamp's native queue advances
+                                    // correctly, so this is a no-op there).
+                                    let queue_override = st.position_ms < 15000.0
+                                        && !self.queue.is_empty()
+                                        && self.queue.iter().any(|t| !t.uri.is_empty())
+                                        && !self.queue.iter().any(|t| t.uri == st.uri);
+                                    if queue_override {
+                                        let head = self.queue.remove(0);
+                                        self.forced_uri = Some(head.uri.clone());
+                                        self.log(format!("queue: overriding the player's pick with {}", head.title));
+                                        if !self.dry_run {
+                                            self.player.open_uri(&head.uri, &head.title, &head.artist);
+                                        }
+                                        self.broadcast(json!({"type": "Q", "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>()}));
+                                        self.sync_shared(|s| s.queue = self.queue.clone());
+                                        return;
+                                    }
+                                }
                                 // drain display-queue entries that just played
                                 if let Some(idx) = self.queue.iter().position(|t| t.uri == st.uri) {
                                     self.queue.drain(..=idx);
