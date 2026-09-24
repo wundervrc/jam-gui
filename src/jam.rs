@@ -1567,6 +1567,17 @@ impl JamCore {
                                     self.broadcast(json!({"type": "Q", "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>()}));
                                     self.sync_shared(|s| s.queue = self.queue.clone());
                                 }
+                                // backfill artist/art from the player for entries missing them
+                                if !st.artist.is_empty() || !st.art_url.is_empty() {
+                                    for q in self.queue.iter_mut() {
+                                        if q.uri == st.uri {
+                                            if q.artist.is_empty() { q.artist = st.artist.clone(); }
+                                            if q.art_url.is_empty() { q.art_url = st.art_url.clone(); }
+                                        }
+                                    }
+                                    self.broadcast(json!({"type": "Q", "queue": self.queue.iter().map(track_to_json).collect::<Vec<_>>()}));
+                                    self.sync_shared(|s| s.queue = self.queue.clone());
+                                }
                                 // song changes start at 0 — never trust the player's
                                 // position here (it can be stale, e.g. cached or the
                                 // previous track's). Grace period ignores stale reads.

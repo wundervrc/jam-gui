@@ -118,8 +118,7 @@ impl eframe::App for JamApp {
             ui.add_space(4.0);
         });
 
-        egui::TopBottomPanel::bottom("compat").show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
+        egui::TopBottomPanel::bottom("compat").show(ctx, |ui| {            ui.vertical_centered(|ui| {
                 ui.add_space(3.0);
                 ui.label(
                     egui::RichText::new("♪ compatible with Kyzen's Spotify Jam (spicetify-jam)")
@@ -129,6 +128,29 @@ impl eframe::App for JamApp {
                 ui.add_space(2.0);
             });
         });
+
+        // debug log pane (bottom, collapsible) — shows the core's log buffer
+        egui::TopBottomPanel::bottom("debuglog")
+            .resizable(true)
+            .default_height(90.0)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("log").weak().size(10.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("clear").clicked() {
+                            self.shared.lock().unwrap().logs.clear();
+                        }
+                    });
+                });
+                egui::ScrollArea::vertical().stick_to_bottom(true).show_rows(ui, 11.0, s.logs.len(), |ui, row_range| {
+                    for i in row_range {
+                        if let Some(line) = s.logs.get(i) {
+                            ui.monospace(egui::RichText::new(line).size(10.0));
+                        }
+                    }
+                });
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| match snapshot.mode {
             Mode::Idle | Mode::Joining => self.idle_screen(ui, &snapshot),
