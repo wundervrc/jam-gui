@@ -170,7 +170,9 @@ impl PlayerBackend for MprisPlayer {
         if uri.is_empty() {
             return;
         }
-        let _ = self.proxy.call_method("OpenUri", &(uri.to_string()));
+        if let Err(e) = self.proxy.call_method("OpenUri", &(uri.to_string())) {
+            crate::player::debug_log(&format!("mpris OpenUri({uri}) failed: {e}"));
+        }
     }
 
     fn seek_ms(&mut self, ms: f64) {
