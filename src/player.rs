@@ -723,8 +723,12 @@ impl SpotifastWinPlayer {
         let title = title.to_string();
         let artist = artist.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
+        crate::player::debug_log(&format!("uri lookup started: {key:?}"));
         std::thread::spawn(move || {
-            let _ = tx.send(resolve_any_uri(&title, &artist, duration_ms));
+            crate::player::debug_log("uri lookup thread running");
+            let result = resolve_any_uri(&title, &artist, duration_ms);
+            crate::player::debug_log(&format!("uri lookup finished: {result:?}"));
+            let _ = tx.send(result);
         });
         self.resolving = Some((key, rx));
         None
