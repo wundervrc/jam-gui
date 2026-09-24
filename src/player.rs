@@ -407,13 +407,327 @@ pub fn find_running_process_exe(names: &[&str]) -> Option<std::path::PathBuf> {
 pub struct SpotifastWinPlayer {
     /// candidate binary names, tried in order; the first that spawns wins
     bin: String,
+    /// resolved uris by "title|artist" — the CLI has no uri, so we look it
+    /// up (web api → deezer/musicbrainz) once per track
+    uri_cache: std::collections::HashMap<String, Option<String>>,
+    /// in-flight lookup: (key, receiver for the resolved uri)
+    resolving: Option<(String, std::sync::mpsc::Receiver<Option<String>>)>,
+}
+
+#[cfg(windows)]
+mod win_cred {
+    use std::os::windows::ffi::EncodeWide;
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+
+    #[repr(C)]
+    struct FileTime {
+        lo: u32,
+        hi: u32,
+    }
+    #[repr(C)]
+    struct Credential {
+        flags: u32,
+        cred_type: u32,
+        target_name: *const u16,
+        comment: *const u16,
+        last_written: FileTime,
+        blob_size: u32,
+        blob: *const u8,
+        persist: u32,
+        attr_count: u32,
+        attributes: *const std::ffi::c_void,
+        target_alias: *const u16,
+        user_name: *const u16,
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredReadW(target: *const u16, cred_type: u32, flags: u32, cred: *mut *mut Credential) -> i32;
+        fn CredEnumerateW(filter: *const u16, flags: u32, count: *mut u32, creds: *mut *mut *mut Credential) -> i32;
+        fn CredFree(cred: *mut std::ffi::c_void);
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+    fn read_str(p: *const u16) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe {
+            let mut len = 0usize;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+        }
+    }
+
+    /// read a generic credential's blob as utf-8 by exact target name
+    fn read_credential(target: &str) -> Option<Vec<u8>> {
+        let wtarget = wide(target);
+        let mut p: *mut Credential = std::ptr::null_mut();
+        let ok = unsafe { CredReadW(wtarget.as_ptr(), CRED_TYPE_GENERIC, 0, &mut p) };
+        if ok == 0 || p.is_null() {
+            return None;
+        }
+        unsafe {
+            let c = &*p;
+            let blob = if c.blob_size > 0 && !c.blob.is_null() {
+                Some(std::slice::from_raw_parts(c.blob, c.blob_size as usize).to_vec())
+            } else {
+                None
+            };
+            CredFree(p as *mut std::ffi::c_void);
+            blob
+        }
+    }
+
+    /// find the shared-web grant credential: spotifast names its web-token
+    /// entry "<profile>:shared-web.rocks.fastpotify.Fastpotify" (or
+    /// ".rocks.spotifast.Spotifast" in newer builds). The freshest wins.
+    pub fn read_shared_web_grant() -> Option<(String, String, String, i64)> {
+        let filter = wide("*");
+        let mut count: u32 = 0;
+        let mut list: *mut *mut Credential = std::ptr::null_mut();
+        let ok = unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut list) };
+        if ok == 0 || list.is_null() {
+            return None;
+        }
+        let mut best: Option<(i64, Vec<u8>)> = None;
+        unsafe {
+            for i in 0..count as usize {
+                let p = *list.add(i);
+                if p.is_null() {
+                    continue;
+                }
+                let c = &*p;
+                let target = read_str(c.target_name);
+                let suffix_ok = target.ends_with(":shared-web.rocks.fastpotify.Fastpotify")
+                    || target.ends_with(":shared-web.rocks.spotifast.Spotifast");
+                if !suffix_ok {
+                    continue;
+                }
+                let blob = if c.blob_size > 0 && !c.blob.is_null() {
+                    std::slice::from_raw_parts(c.blob, c.blob_size as usize).to_vec()
+                } else {
+                    continue;
+                };
+                let stamp = (c.last_written.hi as i64) << 32 | c.last_written.lo as i64;
+                if best.as_ref().map(|(t, _)| stamp > *t).unwrap_or(true) {
+                    best = Some((stamp, blob));
+                }
+            }
+            CredFree(list as *mut std::ffi::c_void);
+        }
+        let (_, blob) = best?;
+        String::from_utf8(blob).ok()
+    }
+}
+
+/// the stored grant JSON: { grant: { Web: { client_id, access_token,
+/// refresh_token, expires_at, scope } } }
+#[cfg(windows)]
+fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let grant_json = win_cred::read_shared_web_grant()?;
+    let v: serde_json::Value = serde_json::from_str(&grant_json).ok()?;
+    let web = v.pointer("/grant/Web")?;
+    let cid = web.get("client_id").and_then(|x| x.as_str())?.to_string();
+    let rtok = web.get("refresh_token").and_then(|x| x.as_str())?.to_string();
+    let exp = web.get("expires_at").and_then(|x| x.as_i64()).unwrap_or(0);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(8))
+        .build();
+    // expired? refresh with the public PKCE client (no secret; spotify does
+    // not rotate the app's stored refresh token, so the app keeps working)
+    let tok = if exp - 60 > now {
+        web.get("access_token").and_then(|x| x.as_str())?.to_string()
+    } else {
+        let resp = agent
+            .post("https://accounts.spotify.com/api/token")
+            .send_form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", rtok.as_str()),
+                ("client_id", cid.as_str()),
+            ])
+            .ok()?
+            .into_json::<serde_json::Value>()
+            .ok()?;
+        crate::player::debug_log("web api token refreshed");
+        resp.get("access_token").and_then(|x| x.as_str())?.to_string()
+    };
+    let v = agent
+        .get("https://api.spotify.com/v1/me/player")
+        .set("Authorization", &format!("Bearer {tok}"))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let uri = v.pointer("/item/uri").and_then(|x| x.as_str())?;
+    if !uri.starts_with("spotify:track:") {
+        return None;
+    }
+    let title = v.pointer("/item/name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let artist = v
+        .pointer("/item/artists")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|a| a.get("name"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let art = v
+        .pointer("/item/album/images")
+        .and_then(|i| i.as_array())
+        .and_then(|i| i.first())
+        .and_then(|i| i.get("url"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let dur = v.pointer("/item/duration_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    Some((uri.to_string(), title, artist, art, dur))
+}
+
+/// uri resolution for the spotifast-cli backend: web api on windows (exact,
+/// real-time), deezer/musicbrainz search elsewhere (best effort)
+fn resolve_any_uri(title: &str, artist: &str, duration_ms: f64) -> Option<String> {
+    #[cfg(windows)]
+    {
+        if let Some((uri, api_title, _, _, _)) = web_api_now_playing() {
+            // guard against a race where the app skipped during resolution
+            let a = title.to_lowercase();
+            let b = api_title.to_lowercase();
+            if a == b || a.contains(&b) || b.contains(&a) {
+                return Some(uri);
+            }
+            crate::player::debug_log("web api title mismatch — falling back to search");
+        }
+    }
+    resolve_track_uri(title, artist, duration_ms)
+}
+
+/// Look up a spotify track uri from title + artist + duration via public
+/// no-auth services: deezer search (→ isrc) → musicbrainz (→ spotify link).
+fn resolve_track_uri(title: &str, artist: &str, duration_ms: f64) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(8))
+        .build();
+    // 1) deezer: plain-text search, filter client-side by artist + duration
+    let q = format!("{title} {artist}");
+    let url = format!("https://api.deezer.com/search?q={}", urlencode(&q));
+    let v: serde_json::Value = agent.get(&url).call().ok()?.into_json().ok()?;
+    let tracks = v.get("data")?.as_array()?;
+    let mut isrc: Option<String> = None;
+    for t in tracks {
+        let t_artist = t.pointer("/artist/name").and_then(|a| a.as_str()).unwrap_or("");
+        let dur = t.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0);
+        let artist_ok = artist.is_empty()
+            || t_artist.to_lowercase().split(',').any(|p| {
+                let p = p.trim();
+                !p.is_empty() && (artist.to_lowercase().contains(p) || p.contains(&artist.to_lowercase()))
+            });
+        let dur_ok = duration_ms <= 0.0 || dur <= 0.0 || (dur * 1000.0 - duration_ms).abs() < 5000.0;
+        if artist_ok && dur_ok {
+            isrc = t.get("isrc").and_then(|i| i.as_str()).map(String::from);
+            break;
+        }
+    }
+    let isrc = isrc?;
+    // 2) musicbrainz: isrc → recordings (1 req/s limit is fine, one per track)
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let mb = format!("https://musicbrainz.org/ws/2/isrc/{isrc}?fmt=json");
+    let v: serde_json::Value = agent.get(&mb)
+        .set("User-Agent", "jam-gui/0.1 (listen-together client)")
+        .call().ok()?.into_json().ok()?;
+    let recordings: Vec<String> = v.get("recordings")?.as_array()?
+        .iter().filter_map(|r| r.get("id").and_then(|i| i.as_str()).map(String::from)).collect();
+    // 3) each recording → url-rels → open.spotify.com/track link
+    for mbid in recordings.iter().take(3) {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let url = format!("https://musicbrainz.org/ws/2/recording/{mbid}?inc=url-rels&fmt=json");
+        let Ok(resp) = agent.get(&url)
+            .set("User-Agent", "jam-gui/0.1 (listen-together client)")
+            .call() else { continue };
+        let Ok(v) = resp.into_json::<serde_json::Value>() else { continue };
+        if let Some(rels) = v.get("relations").and_then(|r| r.as_array()) {
+            for rel in rels {
+                if rel.get("type").and_then(|t| t.as_str()) != Some("free streaming")
+                    && rel.get("type").and_then(|t| t.as_str()) != Some("streaming") {
+                    continue;
+                }
+                if let Some(res) = rel.pointer("/url/resource").and_then(|u| u.as_str()) {
+                    if let Some(id) = res.strip_prefix("https://open.spotify.com/track/") {
+                        let id = id.trim_end_matches('/');
+                        if id.len() == 22 {
+                            return Some(format!("spotify:track:{id}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// percent-encode for query strings
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 impl SpotifastWinPlayer {
     pub fn new() -> Self {
         Self {
             bin: std::env::var("SPOTIFAST_BIN").unwrap_or_else(|_| "spotifast".into()),
+            uri_cache: std::collections::HashMap::new(),
+            resolving: None,
         }
+    }
+
+    /// the CLI has no uri — resolve one in the background (deezer → isrc →
+    /// musicbrainz → spotify link); cached, one lookup per track change
+    fn resolve_uri(&mut self, title: &str, artist: &str, duration_ms: f64) -> Option<String> {
+        let key = format!("{title}|{artist}");
+        // collect finished lookups
+        if let Some((pending_key, rx)) = &self.resolving {
+            if let Ok(result) = rx.try_recv() {
+                let pending_key = pending_key.clone();
+                let (pk, _) = self.resolving.take().unwrap();
+                self.uri_cache.insert(pk, result.clone());
+                if pending_key == key {
+                    if result.is_some() {
+                        crate::player::debug_log(&format!("uri resolved for {key:?}"));
+                    } else {
+                        crate::player::debug_log(&format!("no uri found for {key:?}"));
+                    }
+                }
+            }
+        }
+        match self.uri_cache.get(&key) {
+            Some(Some(uri)) => return Some(uri.clone()),
+            Some(None) => return None, // cached negative
+            None => {}
+        }
+        // kick off a lookup if none in flight for this key
+        let in_flight = self.resolving.as_ref().map(|(k, _)| k.clone());
+        if in_flight.as_deref() == Some(key.as_str()) {
+            return None; // still working on it
+        }
+        let title = title.to_string();
+        let artist = artist.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_any_uri(&title, &artist, duration_ms));
+        });
+        self.resolving = Some((key, rx));
+        None
     }
 
     fn run(&self, args: &[&str]) -> Option<String> {
@@ -477,13 +791,22 @@ impl PlayerBackend for SpotifastWinPlayer {
         //         volume, shuffle, repeat, art_url, saved, device
         let position_ms: f64 = f[4].parse().unwrap_or(0.0);
         let duration_ms: f64 = f[5].parse().unwrap_or(0.0);
+        let title = f[1].to_string();
+        let artist = f[2].to_string();
+        // the CLI never reports a uri — resolve one in the background so the
+        // host can hand guests something to play (cliamp/mpris guests)
+        let uri = if title.is_empty() {
+            String::new()
+        } else {
+            self.resolve_uri(&title, &artist, duration_ms).unwrap_or_default()
+        };
         Some(PlayerState {
             playing: f[0].eq_ignore_ascii_case("playing"),
             position_ms,
             duration_ms,
-            uri: String::new(), // the CLI does not expose the uri; matching is title-based
-            title: f[1].to_string(),
-            artist: f[2].to_string(),
+            uri,
+            title,
+            artist,
             art_url: f[9].to_string(),
         })
     }
@@ -509,5 +832,15 @@ impl PlayerBackend for SpotifastWinPlayer {
 
     fn next(&mut self) {
         self.run(&["next"]);
+    }
+}
+
+#[cfg(test)]
+mod uri_tests {
+    #[test]
+    fn resolves_known_track() {
+        let uri = super::resolve_track_uri("DAMN", "JOYRYDE, Freddie Gibbs", 220839.0);
+        println!("resolved: {uri:?}");
+        assert!(uri.is_some());
     }
 }

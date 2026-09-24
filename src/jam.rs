@@ -270,6 +270,9 @@ pub struct JamCore {
     /// guest side: track playing locally when the session started — that song
     /// is not a "pick", so guest control must not push it to the host
     join_baseline: Option<String>,
+    /// guest side: local track (key, pos, dur) at the previous lock tick —
+    /// detecting a change + near-end of the old one = natural advance
+    last_local: Option<(String, f64, f64)>,
     /// Some(true) = backend has its own queue (add_to_queue worked)
     own_queue: Option<bool>,
     // host-side watcher
@@ -347,6 +350,7 @@ impl JamCore {
                     pos: PosTracker::default(),
                     playuri_sent: None,
                     join_baseline: None,
+                    last_local: None,
                     playuri_sent_at: None,
                     own_queue: None,
                     host_last_uri: None,
@@ -594,6 +598,7 @@ impl JamCore {
                 if s.uri.is_empty() { format!("\u{1}{}", s.title) } else { s.uri.clone() }
             })
         }).flatten();
+        self.last_local = None;
 
         let my_id = if host {
             let id = code
@@ -1627,12 +1632,29 @@ impl JamCore {
                         };
                         let uri_changed = self.host_last_uri.as_deref() != Some(track_key.as_str());
                         let first = self.host_last_uri.is_none();
+                        // re-key: the uri JUST resolved for the same track —
+                        // not a new song, don't reset the position
+                        let rekey = !first && !st.uri.is_empty()
+                            && self.host_last_uri.as_deref().map(|k| {
+                                k.contains('\u{1}') && k.starts_with(&format!("{}\u{1}", st.title))
+                            }).unwrap_or(false);
                         if uri_changed {
                             self.pos.reset();
                         }
                         self.host_last_uri = Some(track_key);
                         if uri_changed && !first {
-                            if st.uri.is_empty() && st.title.is_empty() {
+                            if rekey {
+                                // resolved uri for the current song — tell guests
+                                // the real uri at the CURRENT position
+                                self.host_broadcast_play(&st);
+                                self.sync_shared(|s| {
+                                    s.now_playing = Some(Track {
+                                        uri: st.uri.clone(), title: st.title.clone(),
+                                        artist: st.artist.clone(), art_url: st.art_url.clone(),
+                                    });
+                                    s.playing = st.playing;
+                                });
+                            } else if st.uri.is_empty() && st.title.is_empty() {
                                 // player went silent
                                 self.broadcast(json!({"type": "PAUSE"}));
                             } else if st.uri.is_empty() {
@@ -1751,6 +1773,14 @@ impl JamCore {
             return;
         }
         if let Some(st) = self.player.state() {
+            // track the local song between ticks: when it CHANGED since last
+            // tick and the previous one was near its end, spotifast auto-
+            // advanced naturally — ask for a sync, never hijack the host
+            let cur_key = if st.uri.is_empty() { format!("\u{1}{}", st.title) } else { st.uri.clone() };
+            let naturally_advanced = self.last_local.as_ref().map(|(k, pos, dur)| {
+                *k != cur_key && *dur > 0.0 && *dur - *pos < 3500.0
+            }).unwrap_or(false);
+            self.last_local = Some((cur_key.clone(), st.position_ms, st.duration_ms));
             // spotifast-cli does not expose the uri — fall back to title matching
             let on_target = if st.uri.is_empty() && !st.title.is_empty() && !t.title.is_empty() {
                 st.title == t.title
@@ -1763,12 +1793,11 @@ impl JamCore {
                 self.join_baseline = None;
             }
             if !on_target {
-                // natural end-of-track: guests run slightly ahead of the host
-                // and auto-advance into their own junk context moments before
-                // the host broadcasts the real next song — sync, never hijack
-                // (Kyzen's nearEnd guard)
+                // natural end-of-track: the guest auto-advanced into its own
+                // junk context moments before the host broadcasts the real
+                // next song — sync, never hijack (Kyzen's nearEnd guard)
                 let near_end = st.duration_ms > 0.0 && st.duration_ms - st.position_ms < 3000.0;
-                if self.gc && near_end {
+                if self.gc && (naturally_advanced || near_end) {
                     self.send(json!({"type": "SYNC"}));
                     return;
                 }
@@ -1793,6 +1822,13 @@ impl JamCore {
                             return;
                         }
                     }
+                }
+                // uri-less target: there is no uri to open on the guest —
+                // snapping back is impossible, so stand down instead of
+                // looping the lock path every 2s (display/play-pause follow
+                // via the host's broadcasts)
+                if t.uri.is_empty() {
+                    return;
                 }
                 self.log(format!("🔒 locked to Jam (was {})", if st.title.is_empty() { &st.uri } else { &st.title }));
                 let pos = if t.playing {
