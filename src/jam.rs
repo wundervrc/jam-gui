@@ -685,7 +685,7 @@ impl JamCore {
             }
             CoreEvent::SignalClosed => {
                 let mode = self.shared.lock().map(|s| s.mode).unwrap_or(Mode::Idle);
-                if mode != Mode::Idle && !self.closed {
+                if mode != Mode::Idle {
                     // signaling dropped but the session lives — reconnect the
                     // socket (existing data channels survive independently)
                     self.log("signaling server lost — reconnecting…");
