@@ -360,9 +360,9 @@ impl PlayerBackend for CliampPlayer {
 
 /// Append-only debug log next to the exe (only when JAM_DEBUG=1).
 pub fn debug_log(msg: &str) {
-    if std::env::var("JAM_DEBUG").is_err() {
-        return;
-    }
+    // always-on: the file is small and next to the exe — double-clicked GUI
+    // runs have no JAM_DEBUG and no console, so gating on the env var made
+    // field reports undiagnosable
     let path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("jam-gui-debug.log")))
@@ -412,6 +412,9 @@ pub struct SpotifastWinPlayer {
     uri_cache: std::collections::HashMap<String, Option<String>>,
     /// in-flight lookup: (key, receiver for the resolved uri)
     resolving: Option<(String, std::sync::mpsc::Receiver<Option<String>>)>,
+    /// when a lookup failed (429 / not found) — retried after 60s so a
+    /// transient rate limit can't permanently silence a track
+    failed_at: std::collections::HashMap<String, std::time::Instant>,
 }
 
 #[cfg(windows)]
@@ -726,6 +729,7 @@ impl SpotifastWinPlayer {
             bin: std::env::var("SPOTIFAST_BIN").unwrap_or_else(|_| "spotifast".into()),
             uri_cache: std::collections::HashMap::new(),
             resolving: None,
+            failed_at: std::collections::HashMap::new(),
         }
     }
 
@@ -739,18 +743,30 @@ impl SpotifastWinPlayer {
                 let pending_key = pending_key.clone();
                 let (pk, _) = self.resolving.take().unwrap();
                 self.uri_cache.insert(pk, result.clone());
+                if result.is_none() {
+                    self.failed_at.insert(pending_key.clone(), std::time::Instant::now());
+                }
                 if pending_key == key {
                     if result.is_some() {
                         crate::player::debug_log(&format!("uri resolved for {key:?}"));
                     } else {
-                        crate::player::debug_log(&format!("no uri found for {key:?}"));
+                        crate::player::debug_log(&format!("no uri found for {key:?} (will retry)"));
                     }
                 }
             }
         }
         match self.uri_cache.get(&key) {
             Some(Some(uri)) => return Some(uri.clone()),
-            Some(None) => return None, // cached negative
+            Some(None) => {
+                // negative result — retry after 60s (transient rate limits)
+                if let Some(at) = self.failed_at.get(&key) {
+                    if at.elapsed() < std::time::Duration::from_secs(60) {
+                        return None;
+                    }
+                }
+                self.uri_cache.remove(&key);
+                self.failed_at.remove(&key);
+            }
             None => {}
         }
         // kick off a lookup if none in flight for this key

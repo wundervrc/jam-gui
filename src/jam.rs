@@ -391,6 +391,9 @@ impl JamCore {
                 })
                 .unwrap_or_default(),
             msg.into());
+        // mirror to the debug file always — double-clicked GUI runs have no
+        // console and no JAM_DEBUG, and field reports need the trace
+        crate::player::debug_log(&line);
         // JAM_DEBUG: mirror everything to stderr so GUI users can capture it;
         // headless mode prints every line regardless.
         if std::env::var("JAM_DEBUG").is_ok() {
@@ -892,9 +895,10 @@ impl JamCore {
             let t = msg.get("type").and_then(|x| x.as_str()).unwrap_or("?");
             let brief = match t {
                 "PLAY" | "SYNC_TICK" | "PS" | "SEEK" => format!(
-                    "{} uri={} pos={:?} ts={:?}",
+                    "{} uri={} np={:?} pos={:?} ts={:?}",
                     t,
                     msg.get("uri").and_then(|x| x.as_str()).unwrap_or(""),
+                    msg.pointer("/np/title").and_then(|x| x.as_str()).unwrap_or(""),
                     msg.get("pos").and_then(|x| x.as_f64()),
                     msg.get("ts").and_then(|x| x.as_i64()),
                 ),
@@ -1789,7 +1793,12 @@ impl JamCore {
                         self.host_last_playing = Some(st.playing);
                         if play_changed && !uri_changed {
                             if st.playing {
-                                self.host_broadcast_play(&st);
+                                // resolved uri only: a uri-less PLAY wedges
+                                // Kyzen guests (playUri("")); our guests get
+                                // the resume via the rekey broadcast
+                                if !st.uri.is_empty() {
+                                    self.host_broadcast_play(&st);
+                                }
                             } else {
                                 self.broadcast(json!({"type": "PAUSE"}));
                             }
