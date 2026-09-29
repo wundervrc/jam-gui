@@ -407,11 +407,11 @@ pub fn find_running_process_exe(names: &[&str]) -> Option<std::path::PathBuf> {
 pub struct SpotifastWinPlayer {
     /// candidate binary names, tried in order; the first that spawns wins
     bin: String,
-    /// resolved uris by "title|artist" — the CLI has no uri, so we look it
-    /// up (web api → deezer/musicbrainz) once per track
-    uri_cache: std::collections::HashMap<String, Option<String>>,
-    /// in-flight lookup: (key, receiver for the resolved uri)
-    resolving: Option<(String, std::sync::mpsc::Receiver<Option<String>>)>,
+    /// resolved metadata by "title|artist" — the CLI has no uri, so we look
+    /// it up (web api → deezer/musicbrainz) once per track
+    uri_cache: std::collections::HashMap<String, Option<ResolvedMeta>>,
+    /// in-flight lookup: (key, receiver for the resolved metadata)
+    resolving: Option<(String, std::sync::mpsc::Receiver<Option<ResolvedMeta>>)>,
     /// when a lookup failed (429 / not found) — retried after 60s so a
     /// transient rate limit can't permanently silence a track
     failed_at: std::collections::HashMap<String, std::time::Instant>,
@@ -535,9 +535,17 @@ mod win_cred {
 
 /// the stored grant JSON: { grant: { Web: { client_id, access_token,
 /// refresh_token, expires_at, scope } } }
+/// unix secs until which /v1/me/player calls are skipped (429 backoff)
+static WEB_BACKOFF_UNTIL: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 #[cfg(windows)]
 fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let backoff = WEB_BACKOFF_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    if backoff > now {
+        crate::player::debug_log(&format!("web api in 429 backoff for {}s", backoff - now));
+        return None;
+    }
     let grant_json = win_cred::read_shared_web_grant()?;
     let v: serde_json::Value = match serde_json::from_str(&grant_json) {
         Ok(v) => v,
@@ -601,7 +609,25 @@ fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
             }
         },
         Err(e) => {
-            crate::player::debug_log(&format!("me/player failed: {e}"));
+            // 429: honor Retry-After so we stop hammering a rate-limited API
+            let mut wait = 30i64;
+            if let ureq::Error::Status(_code, resp) = &e {
+                if resp.status() == 429 {
+                    if let Some(ra) = resp.header("retry-after") {
+                        wait = ra.parse().unwrap_or(30);
+                    }
+                }
+            }
+            if wait > 0 {
+                WEB_BACKOFF_UNTIL.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64 + wait)
+                        .unwrap_or(0),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            crate::player::debug_log(&format!("me/player failed ({e}) — backing off {wait}s"));
             return None;
         }
     };
@@ -632,20 +658,25 @@ fn web_api_now_playing() -> Option<(String, String, String, String, f64)> {
 
 /// uri resolution for the spotifast-cli backend: web api on windows (exact,
 /// real-time), deezer/musicbrainz search elsewhere (best effort)
-fn resolve_any_uri(title: &str, artist: &str, duration_ms: f64) -> Option<String> {
+/// resolved metadata: (uri, title, artist, art_url) — the web path returns
+/// Spotify's canonical strings (no console-codepage mojibake)
+type ResolvedMeta = (String, String, String, String);
+
+fn resolve_any_uri(title: &str, artist: &str, duration_ms: f64) -> Option<ResolvedMeta> {
     #[cfg(windows)]
     {
-        if let Some((uri, api_title, _, _, _)) = web_api_now_playing() {
+        if let Some((uri, api_title, api_artist, api_art, _)) = web_api_now_playing() {
             // guard against a race where the app skipped during resolution
             let a = title.to_lowercase();
             let b = api_title.to_lowercase();
             if a == b || a.contains(&b) || b.contains(&a) {
-                return Some(uri);
+                return Some((uri, api_title, api_artist, api_art));
             }
             crate::player::debug_log("web api title mismatch — falling back to search");
         }
     }
-    resolve_track_uri(title, artist, duration_ms)
+    let uri = resolve_track_uri(title, artist, duration_ms)?;
+    Some((uri, title.to_string(), artist.to_string(), String::new()))
 }
 
 /// Look up a spotify track uri from title + artist + duration via public
@@ -654,8 +685,11 @@ fn resolve_track_uri(title: &str, artist: &str, duration_ms: f64) -> Option<Stri
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(8))
         .build();
-    // 1) deezer: plain-text search, filter client-side by artist + duration
-    let q = format!("{title} {artist}");
+    // 1) deezer: plain-text search — clean the query (primary artist only,
+    // no parentheticals) so multi-artist/feat. strings don't break matching
+    let clean_title = title.split('(').next().unwrap_or(title).trim();
+    let primary_artist = artist.split(',').next().unwrap_or(artist).trim();
+    let q = format!("{clean_title} {primary_artist}");
     let url = format!("https://api.deezer.com/search?q={}", urlencode(&q));
     let v: serde_json::Value = agent.get(&url).call().ok()?.into_json().ok()?;
     let tracks = v.get("data")?.as_array()?;
@@ -733,9 +767,11 @@ impl SpotifastWinPlayer {
         }
     }
 
-    /// the CLI has no uri — resolve one in the background (deezer → isrc →
-    /// musicbrainz → spotify link); cached, one lookup per track change
-    fn resolve_uri(&mut self, title: &str, artist: &str, duration_ms: f64) -> Option<String> {
+    /// the CLI has no uri — resolve one in the background (web api →
+    /// deezer → musicbrainz); cached, one lookup per track change.
+    /// Returns (uri, title, artist, art) — the web path's canonical
+    /// metadata replaces the CLI's (console-codepage-mangled) strings.
+    fn resolve_uri(&mut self, title: &str, artist: &str, duration_ms: f64) -> Option<ResolvedMeta> {
         let key = format!("{title}|{artist}");
         // collect finished lookups
         if let Some((pending_key, rx)) = &self.resolving {
@@ -747,8 +783,8 @@ impl SpotifastWinPlayer {
                     self.failed_at.insert(pending_key.clone(), std::time::Instant::now());
                 }
                 if pending_key == key {
-                    if result.is_some() {
-                        crate::player::debug_log(&format!("uri resolved for {key:?}"));
+                    if let Some((u, t, _, _)) = &result {
+                        crate::player::debug_log(&format!("uri resolved for {key:?} -> {u} ({t})"));
                     } else {
                         crate::player::debug_log(&format!("no uri found for {key:?} (will retry)"));
                     }
@@ -756,7 +792,7 @@ impl SpotifastWinPlayer {
             }
         }
         match self.uri_cache.get(&key) {
-            Some(Some(uri)) => return Some(uri.clone()),
+            Some(Some(m)) => return Some(m.clone()),
             Some(None) => {
                 // negative result — retry after 60s (transient rate limits)
                 if let Some(at) = self.failed_at.get(&key) {
@@ -853,10 +889,16 @@ impl PlayerBackend for SpotifastWinPlayer {
         let artist = f[2].to_string();
         // the CLI never reports a uri — resolve one in the background so the
         // host can hand guests something to play (cliamp/mpris guests)
-        let uri = if title.is_empty() {
-            String::new()
+        let (uri, title, artist, art_url) = if title.is_empty() {
+            (String::new(), title, artist, f[9].to_string())
         } else {
-            self.resolve_uri(&title, &artist, duration_ms).unwrap_or_default()
+            match self.resolve_uri(&title, &artist, duration_ms) {
+                Some((uri, t, a, art)) => {
+                    let art = if art.is_empty() { f[9].to_string() } else { art };
+                    (uri, t, a, art)
+                }
+                None => (String::new(), title, artist, f[9].to_string()),
+            }
         };
         Some(PlayerState {
             playing: f[0].eq_ignore_ascii_case("playing"),
@@ -865,7 +907,7 @@ impl PlayerBackend for SpotifastWinPlayer {
             uri,
             title,
             artist,
-            art_url: f[9].to_string(),
+            art_url,
         })
     }
 
